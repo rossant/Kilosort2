@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.linalg import svd
 from scipy.signal import butter, filtfilt, lfilter
 
 
@@ -84,6 +85,41 @@ def my_min(S1, sig, varargin=None):
     return S1
 
 
+def whiteningFromCovariance(CC):
+    # function Wrot = whiteningFromCovariance(CC)
+    # takes as input the matrix CC of channel pairwise correlations
+    # outputs a symmetric rotation matrix (also Nchan by Nchan) that rotates
+    # the data onto uncorrelated, unit-norm axes
+
+    E, D, _ = svd(CC)  # covariance eigendecomposition (same as svd for positive-definite matrix)
+    eps = 1e-6
+    Di = np.diag(1. / (D + eps) ** .5)
+    Wrot = E @ Di @ E.T  # this is the symmetric whitening matrix (ZCA transform)
+    return Wrot
+
+
+def whiteningLocal(CC, yc, xc, nRange):
+    # function to perform local whitening of channels
+    # CC is a matrix of Nchan by Nchan correlations
+    # yc and xc are vector of Y and X positions of each channel
+    # nRange is the number of nearest channels to consider
+    Wrot = np.zeros((CC.shape[0], CC.shape[0]))
+
+    for j in range(CC.shape[0]):
+        ds = (xc - xc[j]) ** 2 + (yc - yc[j]) ** 2
+        ilocal = np.argsort(ds)
+        ilocal = ilocal[:nRange]  # take the closest channels to the primary channel. First channel in this list will always be the primary channel.
+
+        wrot0 = whiteningFromCovariance(CC[np.ix_(ilocal, ilocal)])
+        Wrot[ilocal, j] = wrot0[:, 0]  # the first column of wrot0 is the whitening filter for the primary channel
+
+    return Wrot
+
+
 if __name__ == '__main__':
     arr = np.load('../data/arr1000x16.npy')
-    p(my_min(arr, 3))
+    CC = arr[:16, :16]
+    yc = arr[1, :16]
+    xc = arr[2, :16]
+    nRange = 4
+    p(whiteningLocal(CC, yc, xc, nRange))
