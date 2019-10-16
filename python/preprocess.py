@@ -197,6 +197,91 @@ def get_whitening_matrix(dat_path=None, **kwargs):
     return Wrot
 
 
+def get_good_channels(dat_path=None, **kwargs):
+    ops = Bunch(kwargs)
+
+    b1, a1 = get_filter_params(ops.fs, fshigh=ops.fshigh, fslow=ops.fslow)
+
+    Nchan = ops.Nchan
+    NchanTOT = ops.NchanTOT
+    Nbatch = ops.Nbatch
+    ntbuff = ops.ntbuff
+    NTbuff = ops.NTbuff
+    chanMap = ops.chanMap
+    whiteningRange = ops.whiteningRange
+    scaleproc = ops.scaleproc
+    xc = ops.xc
+    yc = ops.yc
+    chanMap = ops.chanMap
+    twind = ops.twind
+    NT = ops.NT
+    fs = ops.fs
+    fshigh = ops.fshigh
+    fslow = ops.fslow
+    nSkipCov = ops.nSkipCov
+    spkTh = ops.spkTh
+    nt0 = ops.nt0
+    minfr_goodchannels = ops.minfr_goodchannels
+
+    b1, a1 = get_filter_params(fs, fshigh=fshigh)
+
+    ibatch = 1
+    ich = np.zeros((50000,), dtype=np.int16)
+    k = 0
+    ttime = 0
+
+    while ibatch <= Nbatch:
+        offset = twind + 2 * NchanTOT * NT * (ibatch - 1)
+
+        buff = np.fromfile(
+            dat_path, dtype=np.int16,
+            count=NchanTOT * NT,
+            offset=offset)
+        buff = buff.reshape((NchanTOT, -1), order='F')
+        if buff.size == 0:
+            break
+
+        datr = gpufilter(buff, channel_map=chanMap, fs=fs, fshigh=fshigh, fslow=fslow)
+        # very basic threshold crossings calculation
+        datr /= np.std(datr, axis=0)  # standardize each channel ( but don't whiten)
+        mdat = my_min(datr, 30, 0)  # get local minima as min value in +/- 30-sample range
+        # take local minima that cross the negative threshold
+        xi, xj = np.nonzero((datr < mdat + 1e-3) & (datr < spkTh))
+
+        # filtering may create transients at beginning or end. Remove those.
+        xj = xj[(xi >= nt0) & (xi <= NT - nt0)]
+
+        # if necessary, extend the variable which holds the spikes
+        if k + xj.size > ich.size:
+            ich = np.concatenate((ich, np.zeros_like(ich)))
+
+        # collect the channel identities for the detected spikes
+        ich[k:k + xj.size] = xj
+        k += xj.size
+
+        # skip every 100 batches
+        ibatch += int(np.ceil(Nbatch / 100))
+
+        # keep track of total time where we took spikes from
+        ttime += datr.shape[0] / fs
+
+    ich = ich[:k]
+
+    # count how many spikes each channel got
+    nc, _ = np.histogram(ich, np.arange(Nchan + 1))
+
+    # divide by total time to get firing rate
+    nc = nc / ttime
+
+    # keep only those channels above the preset mean firing rate
+    igood = nc >= minfr_goodchannels
+
+    print('found %d threshold crossings in %2.2f seconds of data \n' % (k, ttime))
+    print('found %d bad channels \n' % sum(~igood))
+
+    return igood
+
+
 if __name__ == '__main__':
     # arr = np.load('../data/arr1000x16.npy')
     # CC = arr[:16, :16]
@@ -220,6 +305,9 @@ if __name__ == '__main__':
     ops.whiteningRange = 32
     ops.scaleproc = 200
     ops.twind = 0
+    ops.spkTh = -6
+    ops.nt0 = 61
+    ops.minfr_goodchannels = .1
 
     dat_path = '/home/cyrille/git/Kilosort2/experimental/imec_385_100s.bin'
 
@@ -230,5 +318,7 @@ if __name__ == '__main__':
     ops.xc = np.load('../data/xc.npy').squeeze()
     ops.yc = np.load('../data/yc.npy').squeeze()
 
-    Wrot = get_whitening_matrix(dat_path, **ops)
-    p(Wrot)
+    # Wrot = get_whitening_matrix(dat_path, **ops)
+    # p(Wrot)
+
+    get_good_channels(dat_path, **ops)
