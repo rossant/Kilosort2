@@ -1,6 +1,19 @@
+import os
+from pathlib import Path
+import sys
+
 import numpy as np
 from scipy.linalg import svd
 from scipy.signal import butter, filtfilt, lfilter
+import cupy as cp
+import matplotlib.pyplot as plt
+
+
+class Bunch(dict):
+    """A subclass of dictionary with an additional dot syntax."""
+    def __init__(self, *args, **kwargs):
+        super(Bunch, self).__init__(*args, **kwargs)
+        self.__dict__ = self
 
 
 def p(x):
@@ -8,6 +21,15 @@ def p(x):
     print(x[:2, :2])
     print()
     print(x[-2:, -2:])
+
+
+def get_filter_params(fs, fshigh=None, fslow=None):
+    if fslow and fslow < fs / 2:
+        # butterworth filter with only 3 nodes (otherwise it's unstable for float32)
+        return butter(3, (2 * fshigh / fs, 2 * fslow / fs), 'bandpass')
+    else:
+        # butterworth filter with only 3 nodes (otherwise it's unstable for float32)
+        return butter(3, fshigh / fs * 2, 'high')
 
 
 def gpufilter(buff, channel_map=None, fs=None, fslow=None, fshigh=None, car=True):
@@ -19,21 +41,18 @@ def gpufilter(buff, channel_map=None, fs=None, fslow=None, fshigh=None, car=True
     # if ops.fslow is present, it is used as low-pass frequency (discouraged)
 
     # set up the parameters of the filter
-    if fslow and fslow < fs / 2:
-        b1, a1 = butter(3, (2 * fshigh / fs, 2 * fslow / fs), 'bandpass')  # butterworth filter with only 3 nodes (otherwise it's unstable for float32)
-    else:
-        b1, a1 = butter(3, fshigh / fs * 2, 'high')  # butterworth filter with only 3 nodes (otherwise it's unstable for float32)
+    b1, a1 = get_filter_params(fs, fshigh=fshigh, fslow=fslow)
 
     dataRAW = buff.T
     if channel_map is not None:
         dataRAW = dataRAW[:, channel_map]  # subsample only good channels
 
     # subtract the mean from each channel
-    dataRAW -= np.mean(dataRAW, axis=0)  # subtract mean of each channel
+    dataRAW = dataRAW - np.mean(dataRAW, axis=0)  # subtract mean of each channel
 
     # CAR, common average referencing by median
     if car:
-        dataRAW -= np.median(dataRAW, axis=1)[:, np.newaxis]  # subtract median across channels
+        dataRAW = dataRAW - np.median(dataRAW, axis=1)[:, np.newaxis]  # subtract median across channels
 
     # next four lines should be equivalent to filtfilt (which cannot be used because it requires float64)
     datr = lfilter(b1, a1, dataRAW, axis=0)  # causal forward filter
@@ -44,6 +63,7 @@ def gpufilter(buff, channel_map=None, fs=None, fslow=None, fshigh=None, car=True
 
 def _is_vect(x):
     return hasattr(x, '__len__') and len(x) > 1
+
 
 def _make_vect(x):
     if not hasattr(x, '__len__'):
@@ -116,10 +136,99 @@ def whiteningLocal(CC, yc, xc, nRange):
     return Wrot
 
 
+def get_whitening_matrix(dat_path=None, **kwargs):
+    ops = Bunch(kwargs)
+
+    b1, a1 = get_filter_params(ops.fs, fshigh=ops.fshigh, fslow=ops.fslow)
+
+    Nchan = ops.Nchan
+    NchanTOT = ops.NchanTOT
+    Nbatch = ops.Nbatch
+    ntbuff = ops.ntbuff
+    NTbuff = ops.NTbuff
+    chanMap = ops.chanMap
+    whiteningRange = ops.whiteningRange
+    scaleproc = ops.scaleproc
+    xc = ops.xc
+    yc = ops.yc
+    chanMap = ops.chanMap
+    twind = ops.twind
+    NT = ops.NT
+    fs = ops.fs
+    fshigh = ops.fshigh
+    fslow = ops.fslow
+    nSkipCov = ops.nSkipCov
+
+    CC = cp.zeros((Nchan, Nchan))
+
+    ibatch = 1
+    while ibatch <= Nbatch:
+        offset = max(0, twind + 2 * NchanTOT * ((NT - ntbuff) * (ibatch - 1) - 2 * ntbuff))
+
+        buff = np.fromfile(dat_path, dtype=np.int16, count=NchanTOT * NTbuff, offset=offset)
+        buff = buff.reshape((NchanTOT, NTbuff), order='F')
+
+        nsampcurr = buff.shape[1]
+        if nsampcurr < NTbuff:
+            buff[:, nsampcurr:NTbuff] = np.tile(
+                buff[:, nsampcurr - 1], (1, NTbuff - nsampcurr))
+
+        # apply filters and median subtraction
+        # TODO: gpufilter on the GPU
+        datr = gpufilter(buff, fs=fs, fshigh=fshigh, channel_map=chanMap)
+
+        datr_g = cp.asarray(datr)
+
+        CC += cp.dot(datr_g.T, datr_g) / NT  # sample covariance
+
+        ibatch += nSkipCov  # skip this many batches
+
+    CC /= np.ceil((Nbatch - 1) / nSkipCov)
+
+    if whiteningRange < np.inf:
+        #  if there are too many channels, a finite whiteningRange is more robust to noise in the estimation of the covariance
+        whiteningRange = min(whiteningRange, Nchan)
+        Wrot = whiteningLocal(cp.asnumpy(CC), yc, xc, whiteningRange)  # this function performs the same matrix inversions as below, just on subsets of channels around each channel
+    else:
+        Wrot = whiteningFromCovariance(cp.asnumpy(CC))
+
+    Wrot *= scaleproc
+
+    return Wrot
+
+
 if __name__ == '__main__':
-    arr = np.load('../data/arr1000x16.npy')
-    CC = arr[:16, :16]
-    yc = arr[1, :16]
-    xc = arr[2, :16]
-    nRange = 4
-    p(whiteningLocal(CC, yc, xc, nRange))
+    # arr = np.load('../data/arr1000x16.npy')
+    # CC = arr[:16, :16]
+    # yc = arr[1, :16]
+    # xc = arr[2, :16]
+    # nRange = 4
+    # p(whiteningLocal(CC, yc, xc, nRange))
+
+    ops = Bunch()
+    ops.fs = 30000.
+    ops.fshigh = 150.
+    ops.fslow = None
+    ops.Nbatch = 46
+    ops.twind = 0
+    ops.NchanTOT = 385
+    ops.NT = 65600
+    ops.NTbuff = 65856
+    ops.Nchan = 293
+    ops.ntbuff = 64
+    ops.nSkipCov = 25
+    ops.whiteningRange = 32
+    ops.scaleproc = 200
+    ops.twind = 0
+
+    dat_path = '/home/cyrille/git/Kilosort2/experimental/imec_385_100s.bin'
+
+    ops.chanMap = np.load('../data/chanMap.npy').squeeze().astype(np.int64)
+    # WARNING
+    ops.chanMap -= 1
+
+    ops.xc = np.load('../data/xc.npy').squeeze()
+    ops.yc = np.load('../data/yc.npy').squeeze()
+
+    Wrot = get_whitening_matrix(dat_path, **ops)
+    p(Wrot)
