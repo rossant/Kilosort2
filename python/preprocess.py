@@ -4,23 +4,13 @@ import sys
 
 import numpy as np
 from scipy.linalg import svd
-from scipy.signal import butter, filtfilt, lfilter
+from scipy.signal import butter  # , filtfilt, lfilter
 import cupy as cp
 import matplotlib.pyplot as plt
 
+from cptools import lfilter, median, Bunch, p
 
-class Bunch(dict):
-    """A subclass of dictionary with an additional dot syntax."""
-    def __init__(self, *args, **kwargs):
-        super(Bunch, self).__init__(*args, **kwargs)
-        self.__dict__ = self
-
-
-def p(x):
-    print("shape", x.shape, "mean", "%5e" % x.mean())
-    print(x[:2, :2])
-    print()
-    print(x[-2:, -2:])
+np.random.seed(0)
 
 
 def get_filter_params(fs, fshigh=None, fslow=None):
@@ -48,16 +38,15 @@ def gpufilter(buff, channel_map=None, fs=None, fslow=None, fshigh=None, car=True
         dataRAW = dataRAW[:, channel_map]  # subsample only good channels
 
     # subtract the mean from each channel
-    dataRAW = dataRAW - np.mean(dataRAW, axis=0)  # subtract mean of each channel
+    dataRAW -= cp.mean(dataRAW, axis=0)  # subtract mean of each channel
 
     # CAR, common average referencing by median
     if car:
-        dataRAW = dataRAW - np.median(dataRAW, axis=1)[:, np.newaxis]  # subtract median across channels
+        dataRAW = dataRAW - median(dataRAW, axis=1)[:, np.newaxis]  # subtract median across channels
 
     # next four lines should be equivalent to filtfilt (which cannot be used because it requires float64)
     datr = lfilter(b1, a1, dataRAW, axis=0)  # causal forward filter
-    datr = lfilter(b1, a1, datr[::-1, :], axis=0)[::-1, :]
-
+    datr = lfilter(b1, a1, datr, axis=0, reverse=True)  # backward
     return datr
 
 
@@ -89,19 +78,19 @@ def my_min(S1, sig, varargin=None):
 
     for sig, idim in zip(sigall, idims):
         Nd = S1.ndim
-        S1 = np.transpose(S1, [idim] + list(range(0, idim)) + list(range(idim + 1, Nd)))
+        S1 = cp.transpose(S1, [idim] + list(range(0, idim)) + list(range(idim + 1, Nd)))
         dsnew = S1.shape
-        S1 = np.reshape(S1, (S1.shape[0], -1))
+        S1 = cp.reshape(S1, (S1.shape[0], -1))
         dsnew2 = S1.shape
-        S1 = np.concatenate(
-                (np.full((sig, dsnew2[1]), np.inf),
+        S1 = cp.concatenate(
+                (cp.full((sig, dsnew2[1]), np.inf),
                 S1,
-                np.full((sig, dsnew2[1]), np.inf)), axis=0)
+                cp.full((sig, dsnew2[1]), np.inf)), axis=0)
         Smax = S1[:dsnew2[0], :]
         for j in range(1, 2*sig + 1):
-            Smax = np.minimum(Smax, S1[j:j + dsnew2[0], :])
-        S1 = np.reshape(Smax, dsnew)
-    S1 = np.transpose(S1, list(range(1, idim + 1)) + [0] + list(range(idim + 1, Nd)))
+            Smax = cp.minimum(Smax, S1[j:j + dsnew2[0], :])
+        S1 = cp.reshape(Smax, dsnew)
+    S1 = cp.transpose(S1, list(range(1, idim + 1)) + [0] + list(range(idim + 1, Nd)))
     return S1
 
 
@@ -111,10 +100,10 @@ def whiteningFromCovariance(CC):
     # outputs a symmetric rotation matrix (also Nchan by Nchan) that rotates
     # the data onto uncorrelated, unit-norm axes
 
-    E, D, _ = svd(CC)  # covariance eigendecomposition (same as svd for positive-definite matrix)
+    E, D, _ = cp.linalg.svd(CC)  # covariance eigendecomposition (same as svd for positive-definite matrix)
     eps = 1e-6
-    Di = np.diag(1. / (D + eps) ** .5)
-    Wrot = E @ Di @ E.T  # this is the symmetric whitening matrix (ZCA transform)
+    Di = cp.diag(1. / (D + eps) ** .5)
+    Wrot = cp.dot(cp.dot(E, Di), E.T)  # this is the symmetric whitening matrix (ZCA transform)
     return Wrot
 
 
@@ -130,7 +119,7 @@ def whiteningLocal(CC, yc, xc, nRange):
         ilocal = np.argsort(ds)
         ilocal = ilocal[:nRange]  # take the closest channels to the primary channel. First channel in this list will always be the primary channel.
 
-        wrot0 = whiteningFromCovariance(CC[np.ix_(ilocal, ilocal)])
+        wrot0 = cp.asnumpy(whiteningFromCovariance(CC[np.ix_(ilocal, ilocal)]))
         Wrot[ilocal, j] = wrot0[:, 0]  # the first column of wrot0 is the whitening filter for the primary channel
 
     return Wrot
@@ -173,28 +162,30 @@ def get_whitening_matrix(dat_path=None, **kwargs):
             buff[:, nsampcurr:NTbuff] = np.tile(
                 buff[:, nsampcurr - 1], (1, NTbuff - nsampcurr))
 
+        buff_g = cp.asarray(buff, dtype=np.float32)
+        assert cp.isfortran(buff_g)
+        assert buff_g.dtype == np.float32
+
         # apply filters and median subtraction
-        # TODO: gpufilter on the GPU
-        datr = gpufilter(buff, fs=fs, fshigh=fshigh, channel_map=chanMap)
+        datr = gpufilter(buff_g, fs=fs, fshigh=fshigh, channel_map=chanMap)
 
-        datr_g = cp.asarray(datr)
-
-        CC += cp.dot(datr_g.T, datr_g) / NT  # sample covariance
+        CC += cp.dot(datr.T, datr) / NT  # sample covariance
 
         ibatch += nSkipCov  # skip this many batches
 
     CC /= np.ceil((Nbatch - 1) / nSkipCov)
+    # CC = cp.asnumpy(CC)
 
     if whiteningRange < np.inf:
         #  if there are too many channels, a finite whiteningRange is more robust to noise in the estimation of the covariance
         whiteningRange = min(whiteningRange, Nchan)
-        Wrot = whiteningLocal(cp.asnumpy(CC), yc, xc, whiteningRange)  # this function performs the same matrix inversions as below, just on subsets of channels around each channel
+        Wrot = whiteningLocal(CC, yc, xc, whiteningRange)  # this function performs the same matrix inversions as below, just on subsets of channels around each channel
     else:
-        Wrot = whiteningFromCovariance(cp.asnumpy(CC))
+        Wrot = whiteningFromCovariance(CC)
 
     Wrot *= scaleproc
 
-    return Wrot
+    return cp.asnumpy(Wrot)
 
 
 def get_good_channels(dat_path=None, **kwargs):
@@ -226,11 +217,13 @@ def get_good_channels(dat_path=None, **kwargs):
     b1, a1 = get_filter_params(fs, fshigh=fshigh)
 
     ibatch = 1
-    ich = np.zeros((50000,), dtype=np.int16)
+    # ich = np.zeros((50000,), dtype=np.int16)
+    ich = []
     k = 0
     ttime = 0
 
     while ibatch <= Nbatch:
+        print(ibatch, Nbatch)
         offset = twind + 2 * NchanTOT * NT * (ibatch - 1)
 
         buff = np.fromfile(
@@ -241,22 +234,28 @@ def get_good_channels(dat_path=None, **kwargs):
         if buff.size == 0:
             break
 
+        # Put on GPU.
+        buff = cp.asarray(buff, dtype=np.float32)
+        assert cp.isfortran(buff)
         datr = gpufilter(buff, channel_map=chanMap, fs=fs, fshigh=fshigh, fslow=fslow)
+
         # very basic threshold crossings calculation
-        datr /= np.std(datr, axis=0)  # standardize each channel ( but don't whiten)
+        s = cp.std(datr, axis=0)
+        datr /= s  # standardize each channel ( but don't whiten)
         mdat = my_min(datr, 30, 0)  # get local minima as min value in +/- 30-sample range
         # take local minima that cross the negative threshold
-        xi, xj = np.nonzero((datr < mdat + 1e-3) & (datr < spkTh))
+        xi, xj = cp.nonzero((datr < mdat + 1e-3) & (datr < spkTh))
 
         # filtering may create transients at beginning or end. Remove those.
         xj = xj[(xi >= nt0) & (xi <= NT - nt0)]
 
-        # if necessary, extend the variable which holds the spikes
-        if k + xj.size > ich.size:
-            ich = np.concatenate((ich, np.zeros_like(ich)))
+        # # if necessary, extend the variable which holds the spikes
+        # if k + xj.size > ich.size:
+        #     ich = np.concatenate((ich, np.zeros_like(ich)))
 
         # collect the channel identities for the detected spikes
-        ich[k:k + xj.size] = xj
+        # ich[k:k + xj.size] = cp.asnumpy(xj)
+        ich.append(xj)
         k += xj.size
 
         # skip every 100 batches
@@ -265,10 +264,11 @@ def get_good_channels(dat_path=None, **kwargs):
         # keep track of total time where we took spikes from
         ttime += datr.shape[0] / fs
 
-    ich = ich[:k]
+    # ich = ich[:k]
+    ich = cp.concatenate(ich)
 
     # count how many spikes each channel got
-    nc, _ = np.histogram(ich, np.arange(Nchan + 1))
+    nc, _ = cp.histogram(ich, cp.arange(Nchan + 1))
 
     # divide by total time to get firing rate
     nc = nc / ttime

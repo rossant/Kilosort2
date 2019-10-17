@@ -37,7 +37,7 @@ while ibatch<=Nbatch
         break;
     end
 
-    datr    = gpufilter(buff, ops, chanMap); % apply filters and median subtraction
+    datr = gpufilter(buff, ops, chanMap); % apply filters and median subtraction
 
     % very basic threshold crossings calculation
     datr = datr./std(datr,1,1); % standardize each channel ( but don't whiten)
