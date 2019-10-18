@@ -1,16 +1,14 @@
-import os
-from pathlib import Path
-import sys
+import logging
 
 import numpy as np
-from scipy.linalg import svd
-from scipy.signal import butter  # , filtfilt, lfilter
+from scipy.signal import butter
 import cupy as cp
-import matplotlib.pyplot as plt
+from tqdm import tqdm
 
-from cptools import lfilter, median, Bunch, p
+from .cptools import lfilter, median
+from .utils import Bunch
 
-np.random.seed(0)
+logger = logging.getLogger(__name__)
 
 
 def get_filter_params(fs, fshigh=None, fslow=None):
@@ -42,9 +40,11 @@ def gpufilter(buff, channel_map=None, fs=None, fslow=None, fshigh=None, car=True
 
     # CAR, common average referencing by median
     if car:
-        dataRAW = dataRAW - median(dataRAW, axis=1)[:, np.newaxis]  # subtract median across channels
+        # subtract median across channels
+        dataRAW = dataRAW - median(dataRAW, axis=1)[:, np.newaxis]
 
-    # next four lines should be equivalent to filtfilt (which cannot be used because it requires float64)
+    # next four lines should be equivalent to filtfilt (which cannot be
+    # used because it requires float64)
     datr = lfilter(b1, a1, dataRAW, axis=0)  # causal forward filter
     datr = lfilter(b1, a1, datr, axis=0, reverse=True)  # backward
     return datr
@@ -83,9 +83,7 @@ def my_min(S1, sig, varargin=None):
         S1 = cp.reshape(S1, (S1.shape[0], -1))
         dsnew2 = S1.shape
         S1 = cp.concatenate(
-                (cp.full((sig, dsnew2[1]), np.inf),
-                S1,
-                cp.full((sig, dsnew2[1]), np.inf)), axis=0)
+                (cp.full((sig, dsnew2[1]), np.inf), S1, cp.full((sig, dsnew2[1]), np.inf)), axis=0)
         Smax = S1[:dsnew2[0], :]
         for j in range(1, 2*sig + 1):
             Smax = cp.minimum(Smax, S1[j:j + dsnew2[0], :])
@@ -100,7 +98,8 @@ def whiteningFromCovariance(CC):
     # outputs a symmetric rotation matrix (also Nchan by Nchan) that rotates
     # the data onto uncorrelated, unit-norm axes
 
-    E, D, _ = cp.linalg.svd(CC)  # covariance eigendecomposition (same as svd for positive-definite matrix)
+    # covariance eigendecomposition (same as svd for positive-definite matrix)
+    E, D, _ = cp.linalg.svd(CC)
     eps = 1e-6
     Di = cp.diag(1. / (D + eps) ** .5)
     Wrot = cp.dot(cp.dot(E, Di), E.T)  # this is the symmetric whitening matrix (ZCA transform)
@@ -117,10 +116,13 @@ def whiteningLocal(CC, yc, xc, nRange):
     for j in range(CC.shape[0]):
         ds = (xc - xc[j]) ** 2 + (yc - yc[j]) ** 2
         ilocal = np.argsort(ds)
-        ilocal = ilocal[:nRange]  # take the closest channels to the primary channel. First channel in this list will always be the primary channel.
+        # take the closest channels to the primary channel.
+        # First channel in this list will always be the primary channel.
+        ilocal = ilocal[:nRange]
 
         wrot0 = cp.asnumpy(whiteningFromCovariance(CC[np.ix_(ilocal, ilocal)]))
-        Wrot[ilocal, j] = wrot0[:, 0]  # the first column of wrot0 is the whitening filter for the primary channel
+        # the first column of wrot0 is the whitening filter for the primary channel
+        Wrot[ilocal, j] = wrot0[:, 0]
 
     return Wrot
 
@@ -145,14 +147,12 @@ def get_whitening_matrix(dat_path=None, **kwargs):
     NT = ops.NT
     fs = ops.fs
     fshigh = ops.fshigh
-    fslow = ops.fslow
     nSkipCov = ops.nSkipCov
 
     CC = cp.zeros((Nchan, Nchan))
 
-    ibatch = 1
-    while ibatch <= Nbatch:
-        offset = max(0, twind + 2 * NchanTOT * ((NT - ntbuff) * (ibatch - 1) - 2 * ntbuff))
+    for ibatch in tqdm(range(0, Nbatch, nSkipCov), desc="Computing the whitening matrix"):
+        offset = max(0, twind + 2 * NchanTOT * ((NT - ntbuff) * ibatch - 2 * ntbuff))
 
         buff = np.fromfile(dat_path, dtype=np.int16, count=NchanTOT * NTbuff, offset=offset)
         buff = buff.reshape((NchanTOT, NTbuff), order='F')
@@ -171,19 +171,21 @@ def get_whitening_matrix(dat_path=None, **kwargs):
 
         CC += cp.dot(datr.T, datr) / NT  # sample covariance
 
-        ibatch += nSkipCov  # skip this many batches
-
     CC /= np.ceil((Nbatch - 1) / nSkipCov)
-    # CC = cp.asnumpy(CC)
 
     if whiteningRange < np.inf:
-        #  if there are too many channels, a finite whiteningRange is more robust to noise in the estimation of the covariance
+        #  if there are too many channels, a finite whiteningRange is more robust to noise
+        # in the estimation of the covariance
         whiteningRange = min(whiteningRange, Nchan)
-        Wrot = whiteningLocal(CC, yc, xc, whiteningRange)  # this function performs the same matrix inversions as below, just on subsets of channels around each channel
+        # this function performs the same matrix inversions as below, just on subsets of
+        # channels around each channel
+        Wrot = whiteningLocal(CC, yc, xc, whiteningRange)
     else:
         Wrot = whiteningFromCovariance(CC)
 
     Wrot *= scaleproc
+
+    logger.info("Computed the whitening matrix.")
 
     return cp.asnumpy(Wrot)
 
@@ -193,38 +195,28 @@ def get_good_channels(dat_path=None, **kwargs):
 
     b1, a1 = get_filter_params(ops.fs, fshigh=ops.fshigh, fslow=ops.fslow)
 
-    Nchan = ops.Nchan
-    NchanTOT = ops.NchanTOT
-    Nbatch = ops.Nbatch
-    ntbuff = ops.ntbuff
-    NTbuff = ops.NTbuff
-    chanMap = ops.chanMap
-    whiteningRange = ops.whiteningRange
-    scaleproc = ops.scaleproc
-    xc = ops.xc
-    yc = ops.yc
-    chanMap = ops.chanMap
-    twind = ops.twind
-    NT = ops.NT
     fs = ops.fs
     fshigh = ops.fshigh
     fslow = ops.fslow
-    nSkipCov = ops.nSkipCov
+    Nchan = ops.Nchan
+    NchanTOT = ops.NchanTOT
+    Nbatch = ops.Nbatch
+    NT = ops.NT
+    chanMap = ops.chanMap
+    twind = ops.twind
     spkTh = ops.spkTh
     nt0 = ops.nt0
     minfr_goodchannels = ops.minfr_goodchannels
 
     b1, a1 = get_filter_params(fs, fshigh=fshigh)
 
-    ibatch = 1
-    # ich = np.zeros((50000,), dtype=np.int16)
     ich = []
     k = 0
     ttime = 0
 
-    while ibatch <= Nbatch:
-        print(ibatch, Nbatch)
-        offset = twind + 2 * NchanTOT * NT * (ibatch - 1)
+    # skip every 100 batches
+    for ibatch in tqdm(range(0, Nbatch, int(np.ceil(Nbatch / 100))), desc="Finding good channels"):
+        offset = twind + 2 * NchanTOT * NT * ibatch
 
         buff = np.fromfile(
             dat_path, dtype=np.int16,
@@ -243,28 +235,20 @@ def get_good_channels(dat_path=None, **kwargs):
         s = cp.std(datr, axis=0)
         datr /= s  # standardize each channel ( but don't whiten)
         mdat = my_min(datr, 30, 0)  # get local minima as min value in +/- 30-sample range
+
         # take local minima that cross the negative threshold
         xi, xj = cp.nonzero((datr < mdat + 1e-3) & (datr < spkTh))
 
         # filtering may create transients at beginning or end. Remove those.
         xj = xj[(xi >= nt0) & (xi <= NT - nt0)]
 
-        # # if necessary, extend the variable which holds the spikes
-        # if k + xj.size > ich.size:
-        #     ich = np.concatenate((ich, np.zeros_like(ich)))
-
         # collect the channel identities for the detected spikes
-        # ich[k:k + xj.size] = cp.asnumpy(xj)
         ich.append(xj)
         k += xj.size
-
-        # skip every 100 batches
-        ibatch += int(np.ceil(Nbatch / 100))
 
         # keep track of total time where we took spikes from
         ttime += datr.shape[0] / fs
 
-    # ich = ich[:k]
     ich = cp.concatenate(ich)
 
     # count how many spikes each channel got
@@ -276,49 +260,7 @@ def get_good_channels(dat_path=None, **kwargs):
     # keep only those channels above the preset mean firing rate
     igood = nc >= minfr_goodchannels
 
-    print('found %d threshold crossings in %2.2f seconds of data \n' % (k, ttime))
-    print('found %d bad channels \n' % sum(~igood))
+    logger.info('Found %d threshold crossings in %2.2f seconds of data.' % (k, ttime))
+    logger.info('Found %d bad channels.' % np.sum(~igood))
 
     return igood
-
-
-if __name__ == '__main__':
-    # arr = np.load('../data/arr1000x16.npy')
-    # CC = arr[:16, :16]
-    # yc = arr[1, :16]
-    # xc = arr[2, :16]
-    # nRange = 4
-    # p(whiteningLocal(CC, yc, xc, nRange))
-
-    ops = Bunch()
-    ops.fs = 30000.
-    ops.fshigh = 150.
-    ops.fslow = None
-    ops.Nbatch = 46
-    ops.twind = 0
-    ops.NchanTOT = 385
-    ops.NT = 65600
-    ops.NTbuff = 65856
-    ops.Nchan = 293
-    ops.ntbuff = 64
-    ops.nSkipCov = 25
-    ops.whiteningRange = 32
-    ops.scaleproc = 200
-    ops.twind = 0
-    ops.spkTh = -6
-    ops.nt0 = 61
-    ops.minfr_goodchannels = .1
-
-    dat_path = '/home/cyrille/git/Kilosort2/experimental/imec_385_100s.bin'
-
-    ops.chanMap = np.load('../data/chanMap.npy').squeeze().astype(np.int64)
-    # WARNING
-    ops.chanMap -= 1
-
-    ops.xc = np.load('../data/xc.npy').squeeze()
-    ops.yc = np.load('../data/yc.npy').squeeze()
-
-    # Wrot = get_whitening_matrix(dat_path, **ops)
-    # p(Wrot)
-
-    get_good_channels(dat_path, **ops)
