@@ -1,12 +1,13 @@
 import logging
+from math import ceil
 
 import numpy as np
 from scipy.signal import butter
 import cupy as cp
 from tqdm import tqdm
 
-from .cptools import lfilter, median
-from .utils import Bunch
+from kspy.cptools import lfilter, median
+from kspy.utils import is_fortran
 
 logger = logging.getLogger(__name__)
 
@@ -20,20 +21,20 @@ def get_filter_params(fs, fshigh=None, fslow=None):
         return butter(3, fshigh / fs * 2, 'high')
 
 
-def gpufilter(buff, channel_map=None, fs=None, fslow=None, fshigh=None, car=True):
+def gpufilter(buff, chanMap=None, fs=None, fslow=None, fshigh=None, car=True):
     # filter this batch of data after common average referencing with the
     # median
     # buff is timepoints by channels
     # chanMap are indices of the channels to be kep
-    # ops.fs and ops.fshigh are sampling and high-pass frequencies respectively
-    # if ops.fslow is present, it is used as low-pass frequency (discouraged)
+    # params.fs and params.fshigh are sampling and high-pass frequencies respectively
+    # if params.fslow is present, it is used as low-pass frequency (discouraged)
 
     # set up the parameters of the filter
     b1, a1 = get_filter_params(fs, fshigh=fshigh, fslow=fslow)
 
     dataRAW = buff.T
-    if channel_map is not None:
-        dataRAW = dataRAW[:, channel_map]  # subsample only good channels
+    if chanMap is not None:
+        dataRAW = dataRAW[:, chanMap]  # subsample only good channels
 
     # subtract the mean from each channel
     dataRAW -= cp.mean(dataRAW, axis=0)  # subtract mean of each channel
@@ -127,51 +128,45 @@ def whiteningLocal(CC, yc, xc, nRange):
     return Wrot
 
 
-def get_whitening_matrix(dat_path=None, **kwargs):
-    ops = Bunch(kwargs)
+def get_whitening_matrix(raw_data=None, probe=None, params=None):
 
-    b1, a1 = get_filter_params(ops.fs, fshigh=ops.fshigh, fslow=ops.fslow)
+    Nbatch = get_Nbatch(raw_data, params)
+    ntbuff = params.ntbuff
+    NTbuff = params.NTbuff
+    whiteningRange = params.whiteningRange
+    scaleproc = params.scaleproc
+    NT = params.NT
+    fs = params.fs
+    fshigh = params.fshigh
+    nSkipCov = params.nSkipCov
 
-    Nchan = ops.Nchan
-    NchanTOT = ops.NchanTOT
-    Nbatch = ops.Nbatch
-    ntbuff = ops.ntbuff
-    NTbuff = ops.NTbuff
-    chanMap = ops.chanMap
-    whiteningRange = ops.whiteningRange
-    scaleproc = ops.scaleproc
-    xc = ops.xc
-    yc = ops.yc
-    chanMap = ops.chanMap
-    twind = ops.twind
-    NT = ops.NT
-    fs = ops.fs
-    fshigh = ops.fshigh
-    nSkipCov = ops.nSkipCov
+    xc = probe.xc
+    yc = probe.yc
+    chanMap = probe.chanMap
+    Nchan = probe.Nchan
+    chanMap = probe.chanMap
 
+    # Nchan is obtained after the bad channels have been removed
     CC = cp.zeros((Nchan, Nchan))
 
     for ibatch in tqdm(range(0, Nbatch, nSkipCov), desc="Computing the whitening matrix"):
-        offset = max(0, twind + 2 * NchanTOT * ((NT - ntbuff) * ibatch - 2 * ntbuff))
-
-        buff = np.fromfile(dat_path, dtype=np.int16, count=NchanTOT * NTbuff, offset=offset)
-        buff = buff.reshape((NchanTOT, NTbuff), order='F')
+        # WARNING: we use Fortran order, so raw_data is NchanTOT x nsamples
+        i = max(0, (NT - ntbuff) * ibatch - 2 * ntbuff)
+        buff = raw_data[:, i:i + NT - ntbuff]
 
         nsampcurr = buff.shape[1]
         if nsampcurr < NTbuff:
-            buff[:, nsampcurr:NTbuff] = np.tile(
-                buff[:, nsampcurr - 1], (1, NTbuff - nsampcurr))
+            buff = np.concatenate(
+                (buff, np.tile(buff[:, nsampcurr - 1][:, np.newaxis], (1, NTbuff))), axis=1)
 
         buff_g = cp.asarray(buff, dtype=np.float32)
-        assert cp.isfortran(buff_g)
-        assert buff_g.dtype == np.float32
 
         # apply filters and median subtraction
-        datr = gpufilter(buff_g, fs=fs, fshigh=fshigh, channel_map=chanMap)
+        datr = gpufilter(buff_g, fs=fs, fshigh=fshigh, chanMap=chanMap)
 
         CC += cp.dot(datr.T, datr) / NT  # sample covariance
 
-    CC /= np.ceil((Nbatch - 1) / nSkipCov)
+    CC /= ceil((Nbatch - 1) / nSkipCov)
 
     if whiteningRange < np.inf:
         #  if there are too many channels, a finite whiteningRange is more robust to noise
@@ -190,46 +185,35 @@ def get_whitening_matrix(dat_path=None, **kwargs):
     return cp.asnumpy(Wrot)
 
 
-def get_good_channels(dat_path=None, **kwargs):
-    ops = Bunch(kwargs)
+def get_good_channels(raw_data=None, probe=None, params=None):
+    fs = params.fs
+    fshigh = params.fshigh
+    fslow = params.fslow
+    Nbatch = get_Nbatch(raw_data, params)
+    NT = params.NT
+    spkTh = params.spkTh
+    nt0 = params.nt0
+    minfr_goodchannels = params.minfr_goodchannels
 
-    b1, a1 = get_filter_params(ops.fs, fshigh=ops.fshigh, fslow=ops.fslow)
-
-    fs = ops.fs
-    fshigh = ops.fshigh
-    fslow = ops.fslow
-    Nchan = ops.Nchan
-    NchanTOT = ops.NchanTOT
-    Nbatch = ops.Nbatch
-    NT = ops.NT
-    chanMap = ops.chanMap
-    twind = ops.twind
-    spkTh = ops.spkTh
-    nt0 = ops.nt0
-    minfr_goodchannels = ops.minfr_goodchannels
-
-    b1, a1 = get_filter_params(fs, fshigh=fshigh)
+    chanMap = probe.chanMap
+    Nchan = probe.Nchan
 
     ich = []
     k = 0
     ttime = 0
 
     # skip every 100 batches
-    for ibatch in tqdm(range(0, Nbatch, int(np.ceil(Nbatch / 100))), desc="Finding good channels"):
-        offset = twind + 2 * NchanTOT * NT * ibatch
-
-        buff = np.fromfile(
-            dat_path, dtype=np.int16,
-            count=NchanTOT * NT,
-            offset=offset)
-        buff = buff.reshape((NchanTOT, -1), order='F')
+    for ibatch in tqdm(range(0, Nbatch, int(ceil(Nbatch / 100))), desc="Finding good channels"):
+        i = NT * ibatch
+        buff = raw_data[:, i:i + NT]
+        assert np.isfortran(buff)
         if buff.size == 0:
             break
 
         # Put on GPU.
         buff = cp.asarray(buff, dtype=np.float32)
         assert cp.isfortran(buff)
-        datr = gpufilter(buff, channel_map=chanMap, fs=fs, fshigh=fshigh, fslow=fslow)
+        datr = gpufilter(buff, chanMap=chanMap, fs=fs, fshigh=fshigh, fslow=fslow)
 
         # very basic threshold crossings calculation
         s = cp.std(datr, axis=0)
@@ -264,3 +248,112 @@ def get_good_channels(dat_path=None, **kwargs):
     logger.info('Found %d bad channels.' % np.sum(~igood))
 
     return igood
+
+
+"""
+
+## independent parameters
+
+NT  # number of timepoints per batch
+nt0  # number of time samples for the templates (need <= 81 due to GPU shared mem)
+nt0min  # time sample where the negative peak should be aligned
+
+nt0 = 61
+nt0min = ceil(20 * nt0 / 61)
+minfr_goodchannels = .1
+nfilt_factor = 4
+
+
+## dependent parameters + (nTimepoints, NChanTOT)
+
+params.NTbuff = params.NT + 4 * params.ntbuff  # we need buffers on both sides for filtering
+
+"""
+
+
+def get_Nbatch(raw_data, params):
+    # WARNING: F order for now, so (n_channels, n_samples)
+    axis = 1 if is_fortran(raw_data) else 0
+    n_samples = raw_data.shape[axis]
+    # we assume raw_data as been already virtually split with the requested trange
+    return ceil(n_samples / (params.NT - params.ntbuff))  # number of data batches
+
+
+def preprocess(raw_data=None, probe=None, params=None, proc_path=None):
+    # function rez = preprocessDataSub(ops)
+    # this function takes an ops struct, which contains all the Kilosort2 settings and file paths
+    # and creates a new binary file of preprocessed data, logging new variables into rez.
+    # The following steps are applied:
+    # 1) conversion to float32
+    # 2) common median subtraction
+    # 3) bandpass filtering
+    # 4) channel whitening
+    # 5) scaling to int16 values
+
+    fs = params.fs
+    fshigh = params.fshigh
+    fslow = params.fslow
+    nTimepoints, NchanTOT = raw_data.shape
+    Nbatch = get_Nbatch(raw_data, params)
+    NT = params.NT
+    NTbuff = params.NTbuff
+
+    if params.minfr_goodchannels > 0:  # discard channels that have very few spikes
+        # determine bad channels
+        probe.igood = get_good_channels(params, probe.chanMap)
+
+        # it's enough to remove bad channels from the channel map, which treats them
+        # as if they are dead
+        probe.chanMap = probe.chanMap[probe.igood]
+        probe.xc = probe.xc[probe.igood]  # removes coordinates of bad channels
+        probe.yc = probe.yc[probe.igood]
+        probe.kcoords = probe.kcoords[probe.igood]
+    else:
+        probe.igood = None
+    probe.Nchan = len(probe.chanMap)  # total number of good channels that we will spike sort
+
+    # upper bound on the number of templates we can have
+    params.Nfilt = params.nfilt_factor * probe.Nchan
+
+    # outputs a rotation matrix (Nchan by Nchan) which whitens the zero-timelag covariance
+    # of the data
+    Wrot = get_whitening_matrix(raw_data=raw_data, probe=probe, params=params)
+
+    logger.info("Loading raw data and applying filters.")
+
+    with open(proc_path, 'wb') as fw:  # open for writing processed data
+        for ibatch in tqdm(range(Nbatch), desc="Preprocessing"):
+            # we'll create a binary file of batches of NT samples, which overlap consecutively
+            # on params.ntbuff samples
+            # in addition to that, we'll read another params.ntbuff samples from before and after,
+            # to have as buffers for filtering
+
+            # number of samples to start reading at.
+            i = (NT - params.ntbuff) * ibatch - 2 * params.ntbuff
+            if ibatch == 0:
+                # The very first batch has no pre-buffer, and has to be treated separately
+                ioffset = 0
+            else:
+                ioffset = params.ntbuff
+
+            buff = raw_data[:, i:i + NTbuff]
+            if buff.size == 0:
+                logger.error("Loaded buffer has an empty size!")
+                break  # this shouldn't really happen, unless we counted data batches wrong
+
+            nsampcurr = buff.shape[1]  # how many time samples the current batch has
+            if nsampcurr < NTbuff:
+                # pad with zeros, if this is the last batch
+                buff[:, nsampcurr:NTbuff] = np.tile(
+                    buff[:, nsampcurr], (1, NTbuff - nsampcurr))
+
+            # apply filters and median subtraction
+            datr = gpufilter(buff, chanMap=probe.chanMap, fs=fs, fshigh=fshigh, fslow=fslow)
+
+            datr = datr[ioffset:ioffset + NT, :]  # remove timepoints used as buffers
+            datr = datr * Wrot  # whiten the data and scale by 200 for int16 range
+
+            # convert to int16, and gather on the CPU side
+            datcpu = np.asnumpy(datr).astype(np.int16)
+            # write this batch to binary file
+            datcpu.tofile(fw)
