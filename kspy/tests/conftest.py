@@ -1,3 +1,4 @@
+from math import ceil
 from pathlib import Path
 import os.path as op
 from pytest import fixture
@@ -38,15 +39,18 @@ def params():
     params.fs = 30000.
     params.fshigh = 150.
     params.fslow = None
-    params.NT = 65600
-    params.NTbuff = 65856
     params.ntbuff = 64
+    params.NT = 65600
+    params.NTbuff = params.NT + 4 * params.ntbuff  # we need buffers on both sides for filtering
     params.nSkipCov = 25
     params.whiteningRange = 32
     params.scaleproc = 200
     params.spkTh = -6
     params.nt0 = 61
     params.minfr_goodchannels = .1
+    params.nfilt_factor = 4
+    params.nt0 = 61
+    params.nt0min = ceil(20 * params.nt0 / 61)
 
     return params
 
@@ -55,11 +59,22 @@ def params():
 def probe(data_path):
     probe = Bunch()
     probe.NchanTOT = 385
-    probe.Nchan = 293
     # WARNING: indexing mismatch with MATLAB hence the -1
     probe.chanMap = np.load(data_path / 'chanMap.npy').squeeze().astype(np.int64) - 1
     probe.xc = np.load(data_path / 'xc.npy').squeeze()
     probe.yc = np.load(data_path / 'yc.npy').squeeze()
+    probe.kcoords = np.load(data_path / 'kcoords.npy').squeeze()
+    return probe
+
+
+@fixture
+def probe_good(data_path, probe):
+    igood = np.load(data_path / 'igood.npy').squeeze()
+    probe.Nchan = np.sum(igood)
+    probe.chanMap = probe.chanMap[igood]
+    probe.xc = probe.xc[igood]
+    probe.yc = probe.yc[igood]
+    probe.kcoords = probe.kcoords[igood]
     return probe
 
 

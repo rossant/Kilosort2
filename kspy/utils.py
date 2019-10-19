@@ -23,7 +23,8 @@ def is_fortran(x):
 def read_data(dat_path, offset=0, shape=None, dtype=None, axis=0):
     count = shape[0] * shape[1] if shape and -1 not in shape else -1
     buff = np.fromfile(dat_path, dtype=dtype, count=count, offset=offset)
-    if -1 not in shape:
+    if shape and -1 not in shape:
         shape = (-1, shape[1]) if axis == 0 else (shape[0], -1)
-    buff = buff.reshape(shape, order='F')
+    if shape:
+        buff = buff.reshape(shape, order='F')
     return buff

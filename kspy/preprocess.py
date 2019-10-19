@@ -7,7 +7,7 @@ import cupy as cp
 from tqdm import tqdm
 
 from kspy.cptools import lfilter, median
-from kspy.utils import is_fortran
+from kspy.utils import is_fortran, p
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ def gpufilter(buff, chanMap=None, fs=None, fslow=None, fshigh=None, car=True):
         dataRAW = dataRAW[:, chanMap]  # subsample only good channels
 
     # subtract the mean from each channel
-    dataRAW -= cp.mean(dataRAW, axis=0)  # subtract mean of each channel
+    dataRAW = dataRAW - cp.mean(dataRAW, axis=0)  # subtract mean of each channel
 
     # CAR, common average referencing by median
     if car:
@@ -112,7 +112,7 @@ def whiteningLocal(CC, yc, xc, nRange):
     # CC is a matrix of Nchan by Nchan correlations
     # yc and xc are vector of Y and X positions of each channel
     # nRange is the number of nearest channels to consider
-    Wrot = np.zeros((CC.shape[0], CC.shape[0]))
+    Wrot = cp.zeros((CC.shape[0], CC.shape[0]))
 
     for j in range(CC.shape[0]):
         ds = (xc - xc[j]) ** 2 + (yc - yc[j]) ** 2
@@ -182,7 +182,7 @@ def get_whitening_matrix(raw_data=None, probe=None, params=None):
 
     logger.info("Computed the whitening matrix.")
 
-    return cp.asnumpy(Wrot)
+    return Wrot
 
 
 def get_good_channels(raw_data=None, probe=None, params=None):
@@ -196,7 +196,8 @@ def get_good_channels(raw_data=None, probe=None, params=None):
     minfr_goodchannels = params.minfr_goodchannels
 
     chanMap = probe.chanMap
-    Nchan = probe.Nchan
+    # Nchan = probe.Nchan
+    NchanTOT = len(chanMap)
 
     ich = []
     k = 0
@@ -236,39 +237,18 @@ def get_good_channels(raw_data=None, probe=None, params=None):
     ich = cp.concatenate(ich)
 
     # count how many spikes each channel got
-    nc, _ = cp.histogram(ich, cp.arange(Nchan + 1))
+    nc, _ = cp.histogram(ich, cp.arange(NchanTOT + 1))
 
     # divide by total time to get firing rate
     nc = nc / ttime
 
     # keep only those channels above the preset mean firing rate
-    igood = nc >= minfr_goodchannels
+    igood = cp.asnumpy(nc >= minfr_goodchannels)
 
     logger.info('Found %d threshold crossings in %2.2f seconds of data.' % (k, ttime))
-    logger.info('Found %d bad channels.' % np.sum(~igood))
+    logger.info('Found %d/%d bad channels.' % (np.sum(~igood), len(igood)))
 
     return igood
-
-
-"""
-
-## independent parameters
-
-NT  # number of timepoints per batch
-nt0  # number of time samples for the templates (need <= 81 due to GPU shared mem)
-nt0min  # time sample where the negative peak should be aligned
-
-nt0 = 61
-nt0min = ceil(20 * nt0 / 61)
-minfr_goodchannels = .1
-nfilt_factor = 4
-
-
-## dependent parameters + (nTimepoints, NChanTOT)
-
-params.NTbuff = params.NT + 4 * params.ntbuff  # we need buffers on both sides for filtering
-
-"""
 
 
 def get_Nbatch(raw_data, params):
@@ -293,14 +273,13 @@ def preprocess(raw_data=None, probe=None, params=None, proc_path=None):
     fs = params.fs
     fshigh = params.fshigh
     fslow = params.fslow
-    nTimepoints, NchanTOT = raw_data.shape
     Nbatch = get_Nbatch(raw_data, params)
     NT = params.NT
     NTbuff = params.NTbuff
 
     if params.minfr_goodchannels > 0:  # discard channels that have very few spikes
         # determine bad channels
-        probe.igood = get_good_channels(params, probe.chanMap)
+        probe.igood = get_good_channels(raw_data=raw_data, probe=probe, params=params)
 
         # it's enough to remove bad channels from the channel map, which treats them
         # as if they are dead
@@ -329,7 +308,7 @@ def preprocess(raw_data=None, probe=None, params=None, proc_path=None):
             # to have as buffers for filtering
 
             # number of samples to start reading at.
-            i = (NT - params.ntbuff) * ibatch - 2 * params.ntbuff
+            i = max(0, (NT - params.ntbuff) * ibatch - 2 * params.ntbuff)
             if ibatch == 0:
                 # The very first batch has no pre-buffer, and has to be treated separately
                 ioffset = 0
@@ -343,17 +322,19 @@ def preprocess(raw_data=None, probe=None, params=None, proc_path=None):
 
             nsampcurr = buff.shape[1]  # how many time samples the current batch has
             if nsampcurr < NTbuff:
-                # pad with zeros, if this is the last batch
-                buff[:, nsampcurr:NTbuff] = np.tile(
-                    buff[:, nsampcurr], (1, NTbuff - nsampcurr))
+                buff = np.concatenate(
+                    (buff, np.tile(buff[:, nsampcurr - 1][:, np.newaxis], (1, NTbuff))), axis=1)
 
             # apply filters and median subtraction
+            buff = cp.asarray(buff, dtype=np.float32)
+
             datr = gpufilter(buff, chanMap=probe.chanMap, fs=fs, fshigh=fshigh, fslow=fslow)
 
             datr = datr[ioffset:ioffset + NT, :]  # remove timepoints used as buffers
-            datr = datr * Wrot  # whiten the data and scale by 200 for int16 range
+            datr = cp.dot(datr, Wrot)  # whiten the data and scale by 200 for int16 range
 
             # convert to int16, and gather on the CPU side
-            datcpu = np.asnumpy(datr).astype(np.int16)
+            datcpu = cp.asnumpy(datr).astype(np.int16)
+
             # write this batch to binary file
-            datcpu.tofile(fw)
+            fw.write(datcpu.tobytes('F'))
