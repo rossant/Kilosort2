@@ -30,3 +30,30 @@ def get_SpikeSample(dataRAW, row, col, params):
     # grab the data and reshape it appropriately (time samples  by channels by num spikes)
     clips = dataRAW.T.flat[ix[:, 0, :]].reshape((dt.size, row.size))
     return clips
+
+
+def getClosestChannels(probe, sigma, NchanClosest):
+    # this function outputs the closest channels to each channel,
+    # as well as a Gaussian-decaying mask as a function of pairwise distances
+    # sigma is the standard deviation of this Gaussian-mask
+
+    # compute distances between all pairs of channels
+    C2C = (probe.xc[:, np.newaxis] - probe.xc) ** 2 + (probe.yc[:, np.newaxis] - probe.yc) ** 2
+    C2C = np.sqrt(C2C)
+    Nchan = C2C.shape[0]
+
+    # sort distances
+    isort = np.argsort(C2C, kind='stable', axis=0)
+
+    # take NchanCLosest neighbors for each primary channel
+    iC = isort[:NchanClosest, :]
+
+    # in some cases we want a mask that decays as a function of distance between pairs of channels
+    # this is an awkward indexing to get the corresponding distances
+    ix = iC + np.arange(0, Nchan ** 2, Nchan)
+    mask = np.exp(-C2C.T.flat[ix] ** 2 / (2 * sigma ** 2))
+
+    # masks should be unit norm for each channel
+    mask = mask / np.sqrt(1e-3 + np.sum(mask ** 2, axis=0))
+
+    return iC, mask, C2C

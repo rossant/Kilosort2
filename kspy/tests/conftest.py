@@ -1,6 +1,5 @@
 from math import ceil
 from pathlib import Path
-import os.path as op
 from pytest import fixture
 
 import numpy as np

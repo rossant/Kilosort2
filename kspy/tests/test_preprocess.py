@@ -17,7 +17,8 @@ def test_whitening_matrix(data_path, raw_data, probe_good, params):
 
 def test_preprocess_1(data_path, raw_data, probe_good, params):
     # TODO: use probe and not probe_good
-    preprocess(raw_data=raw_data, probe=probe_good, params=params, proc_path=data_path / 'proc.dat')
+    preprocess(
+        raw_data=raw_data, probe=probe_good, params=params, proc_path=data_path / 'proc.dat')
 
 
 def test_preprocess_2(data_path):
