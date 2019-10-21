@@ -121,3 +121,54 @@ def median(a, axis=0):
         indexer[axis] = slice(index-1, index+1)
 
     return cp.mean(part[indexer], axis=axis)
+
+
+def svdecon(X, nPC0=None):
+    """
+    Input:
+    X : m x n matrix
+
+    Output:
+    X = U*S*V'
+
+    Description:
+
+    Does equivalent to svd(X,'econ') but faster
+
+        Vipin Vijayan (2014)
+
+    """
+
+    m, n = X.shape
+
+    nPC = nPC0 or min(m, n)
+
+    if m <= n:
+        C = cp.dot(X, X.T)
+        D, U = cp.linalg.eigh(C)
+
+        ix = cp.argsort(np.abs(D))[::-1]
+        d = D[ix]
+        U = U[:, ix]
+        d = d[:nPC]
+        U = U[:, :nPC]
+
+        V = cp.dot(X.T, U)
+        s = cp.sqrt(d)
+        V = V / s.T
+        S = cp.diag(s)
+    else:
+        C = cp.dot(X.T, X)
+        D, V = cp.linalg.eigh(C)
+
+        ix = cp.argsort(cp.abs(D))[::-1]
+        d = D[ix]
+        V = V[:, ix]
+
+        # convert evecs from X'*X to X*X'. the evals are the same.
+        U = cp.dot(X, V)
+        s = cp.sqrt(d)
+        U = U / s.T
+        S = cp.diag(s)
+
+    return U, S, V
