@@ -6,7 +6,6 @@ function S1 = my_min(S1, sig, varargin)
   % varargin can be the dimensions to do filtering, if len(sig) != x.shape
   % if sig is scalar and no axes are provided, the default axis is 2
 
-
 idims = 2;
 if ~isempty(varargin)
     idims = varargin{1};

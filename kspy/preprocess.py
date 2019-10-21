@@ -89,7 +89,39 @@ def my_min(S1, sig, varargin=None):
         for j in range(1, 2*sig + 1):
             Smax = cp.minimum(Smax, S1[j:j + dsnew2[0], :])
         S1 = cp.reshape(Smax, dsnew)
-    S1 = cp.transpose(S1, list(range(1, idim + 1)) + [0] + list(range(idim + 1, Nd)))
+        S1 = cp.transpose(S1, list(range(1, idim + 1)) + [0] + list(range(idim + 1, Nd)))
+    return S1
+
+
+def my_sum(S1, sig, varargin=None):
+    # returns a running sum applied sequentially across a choice of dimensions and bin sizes
+    # S1 is the matrix to be filtered
+    # sig is either a scalar or a sequence of scalars, one for each axis to be filtered.
+    #  it's the plus/minus bin length for the summing filter
+    # varargin can be the dimensions to do filtering, if len(sig) != x.shape
+    # if sig is scalar and no axes are provided, the default axis is 2
+    idims = 1
+    if varargin is not None:
+        idims = varargin
+    idims = _make_vect(idims)
+    if _is_vect(idims) and _is_vect(sig):
+        sigall = sig
+    else:
+        sigall = np.tile(sig, len(idims))
+
+    for sig, idim in zip(sigall, idims):
+        Nd = S1.ndim
+        S1 = cp.transpose(S1, [idim] + list(range(0, idim)) + list(range(idim + 1, Nd)))
+        dsnew = S1.shape
+        S1 = cp.reshape(S1, (S1.shape[0], -1))
+        dsnew2 = S1.shape
+        S1 = cp.concatenate(
+                (cp.full((sig, dsnew2[1]), 0), S1, cp.full((sig, dsnew2[1]), 0)), axis=0)
+        Smax = S1[:dsnew2[0], :]
+        for j in range(1, 2*sig + 1):
+            Smax = Smax + S1[j:j + dsnew2[0], :]
+        S1 = cp.reshape(Smax, dsnew)
+        S1 = cp.transpose(S1, list(range(1, idim + 1)) + [0] + list(range(idim + 1, Nd)))
     return S1
 
 
