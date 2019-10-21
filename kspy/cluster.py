@@ -1,4 +1,6 @@
 import numpy as np
+import cupy as cp
+from preprocess import my_min, my_sum
 
 
 def get_SpikeSample(dataRAW, row, col, params):
@@ -57,3 +59,22 @@ def getClosestChannels(probe, sigma, NchanClosest):
     mask = mask / np.sqrt(1e-3 + np.sum(mask ** 2, axis=0))
 
     return iC, mask, C2C
+
+
+def isolated_peaks_new(S1, params):
+    S1 = cp.asarray(S1)
+    smin = my_min(S1, params.loc_range, [0, 1])
+
+    peaks = (S1 < smin + 1e-3) & (S1 < params.spkTh)
+
+    sum_peaks = my_sum(peaks, params.long_range, [0, 1])
+    peaks = peaks * (sum_peaks < 1.2) * S1
+
+    peaks[:params.nt0, :] = 0
+    peaks[-params.nt0:, :] = 0
+
+    col, row = np.nonzero(peaks.T)
+
+    mu = -peaks[row, col]
+
+    return row, col, mu
