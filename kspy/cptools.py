@@ -145,7 +145,7 @@ def svdecon(X, nPC0=None):
 
     if m <= n:
         C = cp.dot(X, X.T)
-        D, U = cp.linalg.eigh(C)
+        D, U = cp.linalg.eigh(C, 'U')
 
         ix = cp.argsort(np.abs(D))[::-1]
         d = D[ix]

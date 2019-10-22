@@ -5,37 +5,6 @@ from cptools import svdecon
 from utils import p
 
 
-def get_SpikeSample(dataRAW, row, col, params):
-    nT, nChan = dataRAW.shape
-
-    # times around the peak to consider
-    dt = np.arange(params.nt0)
-
-    # the negativity is expected at nt0min, so we align the detected peaks there
-    dt = -params.nt0min + dt
-
-    # temporal indices (awkward way to index into full matrix of data)
-    indsT = row + dt[:, np.newaxis] + 1  # broadcasting
-
-    indsC = col
-
-    indsC[indsC < 0] = 0  # anything that's out of bounds just gets set to the limit
-    indsC[indsC >= nChan] = nChan - 1  # only needed for channels not time (due to time buffer)
-
-    indsT = np.transpose(np.atleast_3d(indsT), [0, 2, 1])
-
-    indsC = np.transpose(np.atleast_3d(indsC), [2, 0, 1])
-
-    indsT.shape, indsC.shape
-
-    # believe it or not, these indices grab just the right timesamples forour spikes
-    ix = indsT + indsC * nT
-
-    # grab the data and reshape it appropriately (time samples  by channels by num spikes)
-    clips = dataRAW.T.flat[ix[:, 0, :]].reshape((dt.size, row.size))
-    return clips
-
-
 def getClosestChannels(probe, sigma, NchanClosest):
     # this function outputs the closest channels to each channel,
     # as well as a Gaussian-decaying mask as a function of pairwise distances
@@ -75,11 +44,80 @@ def isolated_peaks_new(S1, params):
     peaks[:params.nt0, :] = 0
     peaks[-params.nt0:, :] = 0
 
-    col, row = np.nonzero(peaks.T)
+    col, row = cp.nonzero(peaks.T)
 
     mu = -peaks[row, col]
 
     return row, col, mu
+
+
+def get_SpikeSample(dataRAW, row, col, params):
+    nT, nChan = dataRAW.shape
+
+    # times around the peak to consider
+    dt = cp.arange(params.nt0)
+
+    # the negativity is expected at nt0min, so we align the detected peaks there
+    dt = -params.nt0min + dt
+
+    # temporal indices (awkward way to index into full matrix of data)
+    indsT = row + dt[:, np.newaxis] + 1  # broadcasting
+    indsC = col
+
+    indsC[indsC < 0] = 0  # anything that's out of bounds just gets set to the limit
+    indsC[indsC >= nChan] = nChan - 1  # only needed for channels not time (due to time buffer)
+
+    indsT = cp.transpose(cp.atleast_3d(indsT), [0, 2, 1])
+    indsC = cp.transpose(cp.atleast_3d(indsC), [2, 0, 1])
+
+    # believe it or not, these indices grab just the right timesamples forour spikes
+    ix = indsT + indsC * nT
+
+    # grab the data and reshape it appropriately (time samples  by channels by num spikes)
+    clips = dataRAW.T.ravel()[ix[:, 0, :]].reshape((dt.size, row.size))
+    return clips
+
+
+def extractPCfromSnippets(proc, probe=None, params=None, Nbatch=None):
+    # extracts principal components for 1D snippets of spikes from all channels
+    # loads a subset of batches to find these snippets
+
+    NT = params.NT
+    nPCs = params.nPCs
+    Nchan = probe.Nchan
+
+    batchstart = np.arange(0, NT * Nbatch + 1, NT)
+
+    # extract the PCA projections
+    # initialize the covariance of single-channel spike waveforms
+    CC = cp.zeros(params.nt0, dtype=np.float32)
+
+    # from every 100th batch
+    for ibatch in range(0, Nbatch, 100):
+        offset = Nchan * batchstart[ibatch]
+        dat = proc[offset:offset + NT * Nchan].reshape((-1, Nchan), order='F')
+
+        # move data to GPU and scale it back to unit variance
+        dataRAW = cp.asarray(dat, dtype=np.float32) / params.scaleproc
+
+        # find isolated spikes from each batch
+        row, col, mu = isolated_peaks_new(dataRAW, params)
+
+        # for each peak, get the voltage snippet from that channel
+        c = get_SpikeSample(dataRAW, row, col, params)
+
+        # scale covariance down by 1,000 to maintain a good dynamic range
+        CC = CC + cp.dot(c, c.T) / 1e3
+
+    # the singular vectors of the covariance matrix are the PCs of the waveforms
+    U, Sv, V = svdecon(CC)
+
+    wPCA = U[:, :nPCs]  # take as many as needed
+
+    # adjust the arbitrary sign of the first PC so its negativity is downward
+    wPCA[:, 0] = -wPCA[:, 0] * cp.sign(wPCA[20, 0])
+
+    return wPCA
 
 
 def sortBatches2(ccb0):
@@ -135,3 +173,33 @@ def sortBatches2(ccb0):
     ccb1 = ccb0[isort, :][:, isort]
 
     return ccb1, isort
+
+
+def initializeWdata2(call, uprojDAT, Nchan, nPCs, Nfilt, iC):
+    # this function initializes cluster means for the fast kmeans per batch
+    # call are time indices for the spikes
+    # uprojDAT are features projections (Nfeatures by Nspikes)
+    # some more parameters need to be passed in from the main workspace
+
+    # pick random spikes from the sample
+    irand = np.ceil(np.random.rand(Nfilt, 1) * uprojDAT.shape[1]).astype(np.int32)
+
+    W = cp.zeros((nPCs, Nchan, Nfilt), dtype=np.float32)
+
+    for t in range(Nfilt):
+        ich = iC[:, call[irand[t]]]  # the channels on which this spike lives
+        # for each selected spike, get its features
+        W[:, ich, t] = uprojDAT[:, irand[t]].reshape((nPCs, -1))
+
+    W = W.reshape((-1, Nfilt))
+    # add small amount of noise in case we accidentally picked the same spike twice
+    W = W + .001 * cp.random.normal(size=W.shape).astype(np.float32)
+    mu = cp.sqrt(cp.sum(W ** 2, axis=0))  # get the mean of the template
+    W = W / (1e-5 + mu)  # and normalize the template
+    W = W.reshape((nPCs, Nchan, Nfilt))
+    nW = (W[0, ...] ** 2)  # squared amplitude of the first PC feture
+    W = W.reshape((nPCs * Nchan, Nfilt))
+    # determine biggest channel according to the amplitude of the first PC
+    Wheights = cp.argmax(nW, axis=0)
+
+    return W, mu, Wheights, irand
