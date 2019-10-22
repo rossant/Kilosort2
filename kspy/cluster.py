@@ -1,8 +1,11 @@
+from math import ceil
+
 import numpy as np
 import cupy as cp
+
 from preprocess import my_min, my_sum
-from cptools import svdecon
-from utils import p
+from cptools import svdecon, free_gpu_memory
+from utils import Bunch, p
 
 
 def getClosestChannels(probe, sigma, NchanClosest):
@@ -132,7 +135,8 @@ def sortBatches2(ccb0):
     # compute its svd on the GPU (this might also be fast enough on CPU)
     u, s, v = svdecon(ccb0)
 
-    # initialize the positions xs of the batch embeddings to be very small but proportional to the first PC
+    # initialize the positions xs of the batch embeddings to be very small but proportional to
+    # the first PC
     xs = .01 * u[:, 0] / cp.std(u[:, 0], ddof=1)
 
     # 200 iterations of gradient descent should be enough
@@ -203,3 +207,286 @@ def initializeWdata2(call, uprojDAT, Nchan, nPCs, Nfilt, iC):
     Wheights = cp.argmax(nW, axis=0)
 
     return W, mu, Wheights, irand
+
+
+CUDA_KERNELS = {
+    'Conv1D': '''
+__global__ void Conv1D(const float *Params, const float *data, const float *W, float *conv_sig){
+  volatile __shared__ float  sW[81*NrankMax], sdata[Nthreads+81];
+  float x, y;
+  int tid, tid0, bid, i, nid, Nrank, NT, nt0;
+
+  tid         = threadIdx.x;
+  bid         = blockIdx.x;
+
+  NT          =   (int) Params[0];
+  nt0       = (int) Params[3];
+  Nrank     = (int) Params[6];
+
+  if(tid<nt0*Nrank)
+      sW[tid]= W[tid];
+  __syncthreads();
+
+  tid0 = 0;
+
+  while (tid0<NT-Nthreads-nt0+1){
+      if (tid<nt0)
+          sdata[tid] = data[tid0 + tid+ NT*bid];
+
+      sdata[tid + nt0] = data[tid0 + tid + nt0 + NT*bid];
+      __syncthreads();
+
+      x = 0.0f;
+      for(nid=0;nid<Nrank;nid++){
+          y = 0.0f;
+          #pragma unroll 4
+          for(i=0;i<nt0;i++)
+              y    += sW[i + nid*nt0] * sdata[i+tid];
+
+           x += y*y;
+      }
+      conv_sig[tid0  + tid + NT*bid] = sqrt(x);
+
+      tid0 += Nthreads;
+      __syncthreads();
+  }
+}
+''',
+    'computeProjections': '''
+__global__ void computeProjections(const float *Params, const float *dataraw,
+        const int *iC, const int *st, const int *id, const float *W, float *feat){
+
+    float x;
+    int tidx, nt0min, tidy, my_chan, this_chan, tid, bid, nt0, NchanNear, j, t, NT, NrankPC;
+    volatile __shared__ float sW[nt0max*NrankMax], sD[nt0max*NchanMax];
+
+    NT         = (int) Params[0];
+    NchanNear = (int) Params[2];
+    nt0       = (int) Params[3];
+    NrankPC  = (int) Params[6];
+    nt0min    = (int) Params[4];
+
+    tidx = threadIdx.x;
+    tidy = threadIdx.y;
+    bid = blockIdx.x;
+
+    // move wPCA to shared memory
+    while (tidx<nt0){
+        sW[tidx + tidy*nt0] = W[tidx + tidy*nt0];
+        tidx+=blockDim.x;
+    }
+    tidx = threadIdx.x;
+
+    tid = tidx + tidy*blockDim.x;
+    // move raw data to shared memory
+    while (tid<nt0){
+        my_chan = id[bid];
+        for (j=0;j<NchanNear;j++){
+            this_chan = iC[j + NchanNear*my_chan];
+            sD[tid + nt0*j] = dataraw[tid + st[bid]+nt0min-1 + NT * this_chan];
+        }
+        tid+=blockDim.x*blockDim.y;
+    }
+    __syncthreads();
+
+    x = 0.0f;
+    for (t=0;t<nt0;t++)
+        x += sD[t + nt0*tidx] * sW[t + nt0*tidy];
+
+    feat[tidy + tidx*NrankPC + NrankPC*NchanNear*bid] = x;
+
+    }
+''',
+
+    'maxChannels': '''
+__global__ void maxChannels(const float *Params, const float *dataraw, const float *data,
+    const int *iC, int *st, int *id, int *counter){
+
+  int nt0, indx, tid, tid0, i, bid, NT, Nchan, NchanNear,j,iChan, nt0min;
+  double Cf, d;
+  float spkTh;
+  bool flag;
+
+  NT             = (int) Params[0];
+  Nchan     = (int) Params[1];
+  NchanNear = (int) Params[2];
+  nt0       = (int) Params[3];
+  nt0min    = (int) Params[4];
+  spkTh    = (float) Params[5];
+
+  tid         = threadIdx.x;
+  bid         = blockIdx.x;
+
+  tid0 = tid + bid * blockDim.x;
+  while (tid0<NT-nt0-nt0min){
+      for (i=0; i<Nchan;i++){
+          iChan = iC[0 + NchanNear * i];
+          Cf    = (double) data[tid0 + NT * iChan];
+          flag = true;
+          for(j=1; j<NchanNear; j++){
+              iChan = iC[j+ NchanNear * i];
+              if (data[tid0 + NT * iChan] > Cf){
+                flag = false;
+                break;
+              }
+          }
+
+          if (flag){
+              iChan = iC[NchanNear * i];
+              if (Cf>spkTh){
+                  d = (double) dataraw[tid0+nt0min-1 + NT*iChan]; //
+                  if (d > Cf-1e-6){
+                      // this is a hit, atomicAdd and return spikes
+                      indx = atomicAdd(&counter[0], 1);
+                      if (indx<maxFR){
+                          st[indx] = tid0;
+                          id[indx] = iChan;
+                      }
+                  }
+              }
+          }
+      }
+      tid0 += blockDim.x * gridDim.x;
+  }
+}
+''',
+
+    'max1D': '''
+__global__ void max1D(const float *Params, const float *data, float *conv_sig){
+
+    volatile __shared__ float  sdata[Nthreads+81];
+    float y, spkTh;
+    int tid, tid0, bid, i, NT, nt0;
+
+    NT         = (int) Params[0];
+    nt0       = (int) Params[3];
+    spkTh    = (float) Params[5];
+    tid         = threadIdx.x;
+    bid         = blockIdx.x;
+
+    tid0 = 0;
+    while (tid0<NT-Nthreads-nt0+1){
+        if (tid<nt0)
+            sdata[tid]   = data[tid0 + tid + NT*bid];
+        sdata[tid + nt0] = data[nt0+tid0 + tid+ NT*bid];
+        __syncthreads();
+
+        y = 0.0f;
+        #pragma unroll 4
+        for(i=0;i<nt0;i++)
+            y    = max(y, sdata[tid+i]);
+
+        if (y>spkTh)
+            conv_sig[tid0  + tid + NT*bid]   = y;
+
+        tid0+=Nthreads;
+        __syncthreads();
+    }
+}
+'''
+}
+
+
+CONSTANTS = Bunch(
+    Nthreads=1024,
+    maxFR=10000,
+    NrankMax=3,
+    nt0max=81,
+    NchanMax=17,
+)
+CUDA_CONSTANTS = 'const int ' + ', '.join('%s = %d' % (n, v) for n, v in CONSTANTS.items()) + ';'
+
+
+def _get_kernel(name):
+    return cp.RawKernel(CUDA_CONSTANTS + '\n\n' + 'extern "C" ' + CUDA_KERNELS[name].strip(), name)
+
+
+def mexThSpkPC(Params, dataRAW, wPCA, iC):
+    Nthreads = CONSTANTS.Nthreads
+    maxFR = CONSTANTS.maxFR
+    NT, Nchan, NchanNear, nt0, nt0min, spkTh, NrankPC = Params
+    NT = int(NT)
+    Nchan = int(Nchan)
+
+    # Input GPU arrays.
+    d_Params = cp.asarray(Params, dtype=np.float32, order='F')
+    d_data = cp.asarray(dataRAW, dtype=np.float32, order='F')
+    d_W = cp.asarray(wPCA, dtype=np.float32, order='F')
+    d_iC = cp.asarray(iC, dtype=np.int32, order='F')
+
+    # New GPU arrays.
+    d_dout = cp.zeros(NT * Nchan, dtype=np.float32, order='F')
+    d_dmax = cp.zeros(NT * Nchan, dtype=np.float32, order='F')
+    d_st = cp.zeros(maxFR, dtype=np.int32, order='F')
+    d_id = cp.zeros(maxFR, dtype=np.int32, order='F')
+    d_counter = cp.zeros(1, dtype=np.int32, order='F')
+
+    # filter the data with the temporal templates
+    Conv1D = _get_kernel('Conv1D')
+    Conv1D((Nchan,), (Nthreads,), (d_Params, d_data, d_W, d_dout))
+
+    # get the max of the data
+    max1D = _get_kernel('max1D')
+    max1D((Nchan,), (Nthreads,), (d_Params, d_dout, d_dmax))
+
+    # take max across nearby channels
+    maxChannels = _get_kernel('maxChannels')
+    maxChannels(
+        (int(NT // Nthreads),), (Nthreads,),
+        (d_Params, d_dout, d_dmax, d_iC, d_st, d_id, d_counter))
+
+    # move d_x to the CPU
+    minSize = 1
+    minSize = min(maxFR, int(d_counter[0]))
+
+    d_featPC = cp.zeros((NrankPC * NchanNear, minSize), dtype=np.float32, order='F')
+
+    d_id2 = cp.zeros(minSize, dtype=np.int32, order='F')
+
+    if (minSize > 0):
+        computeProjections = _get_kernel('computeProjections')
+        computeProjections(
+            (minSize,), (NchanNear, NrankPC), (d_Params, d_data, d_iC, d_st, d_id, d_W, d_featPC))
+
+    # TODO: check that the copy occurs on the GPU only
+    d_id2[:] = d_id[:minSize]
+
+    # Free memory.
+    del d_st, d_id, d_counter, d_Params, d_dmax, d_dout
+    # free_gpu_memory()
+
+    return d_featPC, d_id2
+
+
+def extractPCbatch2(proc, params, probe, wPCA, ibatch, iC, Nbatch):
+    # this function finds threshold crossings in the data using
+    # projections onto the pre-determined principal components
+    # wPCA is number of time samples by number of PCs
+    # ibatch is a scalar indicating which batch to analyze
+    # iC is NchanNear by Nchan, indicating for each channel the nearest
+    # channels to it
+
+    nt0min = params.nt0min
+    spkTh = params.ThPre
+    nt0, NrankPC = wPCA.shape
+    NT, Nchan = params.NT, probe.Nchan
+
+    # starts with predefined PCA waveforms
+    wPCA = wPCA[:, :3]
+
+    NchanNear = iC.shape[0]
+
+    batchstart = np.arange(0, NT * Nbatch + 1, NT)  # batches start at these timepoints
+
+    offset = Nchan * batchstart[ibatch]
+    dat = proc[offset:offset + NT * Nchan].reshape((-1, Nchan), order='F')
+    dataRAW = cp.asarray(dat, dtype=np.float32) / params.scaleproc
+
+    # another Params variable to take all our parameters into the C++ code
+    Params = [NT, Nchan, NchanNear, nt0, nt0min, spkTh, NrankPC]
+
+    # call a CUDA function to do the hard work
+    # returns a matrix of features uS, as well as the center channels for each spike
+    uS, idchan = mexThSpkPC(Params, dataRAW, wPCA, iC)
+
+    return uS, idchan
