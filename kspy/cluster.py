@@ -1,5 +1,3 @@
-from math import ceil
-
 import numpy as np
 import cupy as cp
 
@@ -14,23 +12,25 @@ def getClosestChannels(probe, sigma, NchanClosest):
     # sigma is the standard deviation of this Gaussian-mask
 
     # compute distances between all pairs of channels
-    C2C = (probe.xc[:, np.newaxis] - probe.xc) ** 2 + (probe.yc[:, np.newaxis] - probe.yc) ** 2
-    C2C = np.sqrt(C2C)
+    xc = cp.asarray(probe.xc, dtype=np.float32, order='F')
+    yc = cp.asarray(probe.yc, dtype=np.float32, order='F')
+    C2C = (xc[:, np.newaxis] - xc) ** 2 + (yc[:, np.newaxis] - yc) ** 2
+    C2C = cp.sqrt(C2C)
     Nchan = C2C.shape[0]
 
     # sort distances
-    isort = np.argsort(C2C, kind='stable', axis=0)
+    isort = cp.argsort(C2C, axis=0)
 
     # take NchanCLosest neighbors for each primary channel
     iC = isort[:NchanClosest, :]
 
     # in some cases we want a mask that decays as a function of distance between pairs of channels
     # this is an awkward indexing to get the corresponding distances
-    ix = iC + np.arange(0, Nchan ** 2, Nchan)
-    mask = np.exp(-C2C.T.flat[ix] ** 2 / (2 * sigma ** 2))
+    ix = iC + cp.arange(0, Nchan ** 2, Nchan)
+    mask = cp.exp(-C2C.T.ravel()[ix] ** 2 / (2 * sigma ** 2))
 
     # masks should be unit norm for each channel
-    mask = mask / np.sqrt(1e-3 + np.sum(mask ** 2, axis=0))
+    mask = mask / cp.sqrt(1e-3 + cp.sum(mask ** 2, axis=0))
 
     return iC, mask, C2C
 
@@ -98,7 +98,7 @@ def extractPCfromSnippets(proc, probe=None, params=None, Nbatch=None):
     # from every 100th batch
     for ibatch in range(0, Nbatch, 100):
         offset = Nchan * batchstart[ibatch]
-        dat = proc[offset:offset + NT * Nchan].reshape((-1, Nchan), order='F')
+        dat = proc.flat[offset:offset + NT * Nchan].reshape((-1, Nchan), order='F')
 
         # move data to GPU and scale it back to unit variance
         dataRAW = cp.asarray(dat, dtype=np.float32) / params.scaleproc
@@ -193,7 +193,7 @@ def initializeWdata2(call, uprojDAT, Nchan, nPCs, Nfilt, iC):
     for t in range(Nfilt):
         ich = iC[:, call[irand[t]]]  # the channels on which this spike lives
         # for each selected spike, get its features
-        W[:, ich, t] = uprojDAT[:, irand[t]].reshape((nPCs, -1))
+        W[:, ich, t] = cp.atleast_3d(uprojDAT[:, irand[t]].reshape((nPCs, -1)))
 
     W = W.reshape((-1, Nfilt))
     # add small amount of noise in case we accidentally picked the same spike twice
@@ -211,179 +211,490 @@ def initializeWdata2(call, uprojDAT, Nchan, nPCs, Nfilt, iC):
 
 CUDA_KERNELS = {
     'Conv1D': '''
-__global__ void Conv1D(const float *Params, const float *data, const float *W, float *conv_sig){
-  volatile __shared__ float  sW[81*NrankMax], sdata[Nthreads+81];
-  float x, y;
-  int tid, tid0, bid, i, nid, Nrank, NT, nt0;
+    __global__ void Conv1D(
+            const float *Params, const float *data, const float *W, float *conv_sig)
+    {
+        volatile __shared__ float  sW[81*NrankMax], sdata[Nthreads+81];
+        float x, y;
+        int tid, tid0, bid, i, nid, Nrank, NT, nt0;
 
-  tid         = threadIdx.x;
-  bid         = blockIdx.x;
+        tid         = threadIdx.x;
+        bid         = blockIdx.x;
 
-  NT          =   (int) Params[0];
-  nt0       = (int) Params[3];
-  Nrank     = (int) Params[6];
+        NT          =   (int) Params[0];
+        nt0       = (int) Params[3];
+        Nrank     = (int) Params[6];
 
-  if(tid<nt0*Nrank)
-      sW[tid]= W[tid];
-  __syncthreads();
+        if(tid<nt0*Nrank)
+            sW[tid]= W[tid];
+        __syncthreads();
 
-  tid0 = 0;
+        tid0 = 0;
 
-  while (tid0<NT-Nthreads-nt0+1){
-      if (tid<nt0)
-          sdata[tid] = data[tid0 + tid+ NT*bid];
+        while (tid0<NT-Nthreads-nt0+1){
+            if (tid<nt0)
+                sdata[tid] = data[tid0 + tid+ NT*bid];
 
-      sdata[tid + nt0] = data[tid0 + tid + nt0 + NT*bid];
-      __syncthreads();
+            sdata[tid + nt0] = data[tid0 + tid + nt0 + NT*bid];
+            __syncthreads();
 
-      x = 0.0f;
-      for(nid=0;nid<Nrank;nid++){
-          y = 0.0f;
-          #pragma unroll 4
-          for(i=0;i<nt0;i++)
-              y    += sW[i + nid*nt0] * sdata[i+tid];
+            x = 0.0f;
+            for(nid=0;nid<Nrank;nid++){
+                y = 0.0f;
+                #pragma unroll 4
+                for(i=0;i<nt0;i++)
+                    y    += sW[i + nid*nt0] * sdata[i+tid];
 
-           x += y*y;
-      }
-      conv_sig[tid0  + tid + NT*bid] = sqrt(x);
+                x += y*y;
+            }
+            conv_sig[tid0  + tid + NT*bid] = sqrt(x);
 
-      tid0 += Nthreads;
-      __syncthreads();
-  }
-}
-''',
-    'computeProjections': '''
-__global__ void computeProjections(const float *Params, const float *dataraw,
-        const int *iC, const int *st, const int *id, const float *W, float *feat){
-
-    float x;
-    int tidx, nt0min, tidy, my_chan, this_chan, tid, bid, nt0, NchanNear, j, t, NT, NrankPC;
-    volatile __shared__ float sW[nt0max*NrankMax], sD[nt0max*NchanMax];
-
-    NT         = (int) Params[0];
-    NchanNear = (int) Params[2];
-    nt0       = (int) Params[3];
-    NrankPC  = (int) Params[6];
-    nt0min    = (int) Params[4];
-
-    tidx = threadIdx.x;
-    tidy = threadIdx.y;
-    bid = blockIdx.x;
-
-    // move wPCA to shared memory
-    while (tidx<nt0){
-        sW[tidx + tidy*nt0] = W[tidx + tidy*nt0];
-        tidx+=blockDim.x;
-    }
-    tidx = threadIdx.x;
-
-    tid = tidx + tidy*blockDim.x;
-    // move raw data to shared memory
-    while (tid<nt0){
-        my_chan = id[bid];
-        for (j=0;j<NchanNear;j++){
-            this_chan = iC[j + NchanNear*my_chan];
-            sD[tid + nt0*j] = dataraw[tid + st[bid]+nt0min-1 + NT * this_chan];
+            tid0 += Nthreads;
+            __syncthreads();
         }
-        tid+=blockDim.x*blockDim.y;
     }
-    __syncthreads();
+    ''',
 
-    x = 0.0f;
-    for (t=0;t<nt0;t++)
-        x += sD[t + nt0*tidx] * sW[t + nt0*tidy];
+    'computeProjections': '''
+    __global__ void computeProjections(
+            const float *Params, const float *dataraw,
+            const int *iC, const int *st, const int *id, const float *W, float *feat)
+    {
 
-    feat[tidy + tidx*NrankPC + NrankPC*NchanNear*bid] = x;
+        float x;
+        int tidx, nt0min, tidy, my_chan, this_chan, tid, bid, nt0, NchanNear, j, t, NT, NrankPC;
+        volatile __shared__ float sW[nt0max*NrankMax], sD[nt0max*NchanMax];
 
+        NT         = (int) Params[0];
+        NchanNear = (int) Params[2];
+        nt0       = (int) Params[3];
+        NrankPC  = (int) Params[6];
+        nt0min    = (int) Params[4];
+
+        tidx = threadIdx.x;
+        tidy = threadIdx.y;
+        bid = blockIdx.x;
+
+        // move wPCA to shared memory
+        while (tidx<nt0){
+            sW[tidx + tidy*nt0] = W[tidx + tidy*nt0];
+            tidx+=blockDim.x;
+        }
+        tidx = threadIdx.x;
+
+        tid = tidx + tidy*blockDim.x;
+        // move raw data to shared memory
+        while (tid<nt0){
+            my_chan = id[bid];
+            for (j=0;j<NchanNear;j++){
+                this_chan = iC[j + NchanNear*my_chan];
+                sD[tid + nt0*j] = dataraw[tid + st[bid]+nt0min-1 + NT * this_chan];
+            }
+            tid+=blockDim.x*blockDim.y;
+        }
+        __syncthreads();
+
+        x = 0.0f;
+        for (t=0;t<nt0;t++)
+            x += sD[t + nt0*tidx] * sW[t + nt0*tidy];
+
+        feat[tidy + tidx*NrankPC + NrankPC*NchanNear*bid] = x;
     }
-''',
+    ''',
 
     'maxChannels': '''
-__global__ void maxChannels(const float *Params, const float *dataraw, const float *data,
-    const int *iC, int *st, int *id, int *counter){
+    __global__ void maxChannels(
+            const float *Params, const float *dataraw, const float *data,
+            const int *iC, int *st, int *id, int *counter)
+    {
 
-  int nt0, indx, tid, tid0, i, bid, NT, Nchan, NchanNear,j,iChan, nt0min;
-  double Cf, d;
-  float spkTh;
-  bool flag;
+        int nt0, indx, tid, tid0, i, bid, NT, Nchan, NchanNear,j,iChan, nt0min;
+        double Cf, d;
+        float spkTh;
+        bool flag;
 
-  NT             = (int) Params[0];
-  Nchan     = (int) Params[1];
-  NchanNear = (int) Params[2];
-  nt0       = (int) Params[3];
-  nt0min    = (int) Params[4];
-  spkTh    = (float) Params[5];
+        NT        = (int) Params[0];
+        Nchan     = (int) Params[1];
+        NchanNear = (int) Params[2];
+        nt0       = (int) Params[3];
+        nt0min    = (int) Params[4];
+        spkTh    = (float) Params[5];
 
-  tid         = threadIdx.x;
-  bid         = blockIdx.x;
+        tid         = threadIdx.x;
+        bid         = blockIdx.x;
 
-  tid0 = tid + bid * blockDim.x;
-  while (tid0<NT-nt0-nt0min){
-      for (i=0; i<Nchan;i++){
-          iChan = iC[0 + NchanNear * i];
-          Cf    = (double) data[tid0 + NT * iChan];
-          flag = true;
-          for(j=1; j<NchanNear; j++){
-              iChan = iC[j+ NchanNear * i];
-              if (data[tid0 + NT * iChan] > Cf){
-                flag = false;
-                break;
-              }
-          }
+        tid0 = tid + bid * blockDim.x;
+        while (tid0<NT-nt0-nt0min){
+            for (i=0; i<Nchan;i++){
+                iChan = iC[0 + NchanNear * i];
+                Cf    = (double) data[tid0 + NT * iChan];
+                flag = true;
+                for(j=1; j<NchanNear; j++){
+                    iChan = iC[j+ NchanNear * i];
+                    if (data[tid0 + NT * iChan] > Cf){
+                    flag = false;
+                    break;
+                    }
+                }
 
-          if (flag){
-              iChan = iC[NchanNear * i];
-              if (Cf>spkTh){
-                  d = (double) dataraw[tid0+nt0min-1 + NT*iChan]; //
-                  if (d > Cf-1e-6){
-                      // this is a hit, atomicAdd and return spikes
-                      indx = atomicAdd(&counter[0], 1);
-                      if (indx<maxFR){
-                          st[indx] = tid0;
-                          id[indx] = iChan;
-                      }
-                  }
-              }
-          }
-      }
-      tid0 += blockDim.x * gridDim.x;
-  }
-}
-''',
+                if (flag){
+                    iChan = iC[NchanNear * i];
+                    if (Cf>spkTh){
+                        d = (double) dataraw[tid0+nt0min-1 + NT*iChan]; //
+                        if (d > Cf-1e-6){
+                            // this is a hit, atomicAdd and return spikes
+                            indx = atomicAdd(&counter[0], 1);
+                            if (indx<maxFR){
+                                st[indx] = tid0;
+                                id[indx] = iChan;
+                            }
+                        }
+                    }
+                }
+            }
+            tid0 += blockDim.x * gridDim.x;
+        }
+    }
+    ''',
 
     'max1D': '''
-__global__ void max1D(const float *Params, const float *data, float *conv_sig){
+    __global__ void max1D(const float *Params, const float *data, float *conv_sig)
+    {
 
-    volatile __shared__ float  sdata[Nthreads+81];
-    float y, spkTh;
-    int tid, tid0, bid, i, NT, nt0;
+        volatile __shared__ float  sdata[Nthreads+81];
+        float y, spkTh;
+        int tid, tid0, bid, i, NT, nt0;
 
-    NT         = (int) Params[0];
-    nt0       = (int) Params[3];
-    spkTh    = (float) Params[5];
-    tid         = threadIdx.x;
-    bid         = blockIdx.x;
+        NT         = (int) Params[0];
+        nt0       = (int) Params[3];
+        spkTh    = (float) Params[5];
+        tid         = threadIdx.x;
+        bid         = blockIdx.x;
 
-    tid0 = 0;
-    while (tid0<NT-Nthreads-nt0+1){
-        if (tid<nt0)
-            sdata[tid]   = data[tid0 + tid + NT*bid];
-        sdata[tid + nt0] = data[nt0+tid0 + tid+ NT*bid];
-        __syncthreads();
+        tid0 = 0;
+        while (tid0<NT-Nthreads-nt0+1){
+            if (tid<nt0)
+                sdata[tid]   = data[tid0 + tid + NT*bid];
+            sdata[tid + nt0] = data[nt0+tid0 + tid+ NT*bid];
+            __syncthreads();
 
-        y = 0.0f;
-        #pragma unroll 4
-        for(i=0;i<nt0;i++)
-            y    = max(y, sdata[tid+i]);
+            y = 0.0f;
+            #pragma unroll 4
+            for(i=0;i<nt0;i++)
+                y    = max(y, sdata[tid+i]);
 
-        if (y>spkTh)
-            conv_sig[tid0  + tid + NT*bid]   = y;
+            if (y>spkTh)
+                conv_sig[tid0  + tid + NT*bid]   = y;
 
-        tid0+=Nthreads;
-        __syncthreads();
+            tid0+=Nthreads;
+            __syncthreads();
+        }
     }
-}
-'''
+    ''',
+
+    'computeCost': '''
+    __global__ void computeCost(
+            const float *Params, const float *uproj, const float *mu, const float *W,
+            const bool *match, const int *iC, const int *call, float *cmax)
+    {
+        int NrankPC,j, NchanNear, tid, bid, Nspikes, Nthreads, k, my_chan, this_chan, Nchan;
+        float xsum = 0.0f, Ci, lam;
+
+        Nspikes               = (int) Params[0];
+        NrankPC             = (int) Params[1];
+        Nthreads              = blockDim.x;
+        lam                   = (float) Params[5];
+        NchanNear             = (int) Params[6];
+        Nchan                 = (int) Params[7];
+
+        tid 		= threadIdx.x;
+        bid 		= blockIdx.x;
+
+        while(tid<Nspikes){
+            my_chan = call[tid];
+            if (match[my_chan + bid * Nchan]){
+                xsum = 0.0f;
+                for (k=0;k<NchanNear;k++)
+                    for(j=0;j<NrankPC;j++){
+                        this_chan = iC[k + my_chan * NchanNear];
+                        xsum += uproj[j + NrankPC * k + NrankPC*NchanNear * tid] *
+                                W[j + NrankPC * this_chan +  NrankPC*Nchan * bid];
+                    }
+                Ci = max(0.0f, xsum) + lam/mu[bid];
+
+                cmax[tid + bid*Nspikes] = Ci * Ci / (1.0f + lam/(mu[bid] * mu[bid])) - lam;
+            }
+            tid+= Nthreads;
+        }
+    }
+    ''',
+
+    'bestFilter': '''
+    __global__ void bestFilter(
+            const float *Params,  const bool *match,
+            const int *iC, const int *call, const float *cmax, int *id, float *cx)
+    {
+        int Nchan, tid,tind,bid, ind, Nspikes, Nfilters, Nthreads, Nblocks, my_chan;
+        float max_running = 0.0f;
+
+        Nspikes               = (int) Params[0];
+        Nfilters              = (int) Params[2];
+        Nthreads              = blockDim.x;
+        Nblocks               = gridDim.x;
+        Nchan                = (int) Params[7];
+
+        tid 		= threadIdx.x;
+        bid 		= blockIdx.x;
+
+        tind = tid + bid * Nthreads;
+
+        while (tind<Nspikes){
+            max_running = 0.0f;
+            id[tind] = 0;
+            my_chan = call[tind];
+
+            for(ind=0; ind<Nfilters; ind++)
+                if (match[my_chan + ind * Nchan])
+                    if (cmax[tind + ind*Nspikes] > max_running){
+                        id[tind] = ind;
+                        max_running = cmax[tind + ind*Nspikes];
+                    }
+
+
+            cx[tind] = max_running;
+
+            tind += Nblocks*Nthreads;
+        }
+    }''',
+
+    'average_snips': '''
+    __global__ void average_snips(
+            const float *Params, const int *iC, const int *call,
+            const int *id, const float *uproj, const float *cmax, float *WU)
+    {
+
+        int my_chan, this_chan, tidx, tidy, bid, ind, Nspikes, NrankPC, NchanNear, Nchan;
+        float xsum = 0.0f;
+
+        Nspikes               = (int) Params[0];
+        NrankPC             = (int) Params[1];
+        Nchan                = (int) Params[7];
+        NchanNear             = (int) Params[6];
+
+        tidx 		= threadIdx.x;
+        tidy 		= threadIdx.y;
+        bid 		= blockIdx.x;
+
+        for(ind=0; ind<Nspikes;ind++) {
+            if (id[ind]==bid){
+                my_chan = call[ind];
+                this_chan = iC[tidy + NchanNear * my_chan];
+                xsum = uproj[tidx + NrankPC*tidy +  NrankPC*NchanNear * ind];
+                WU[tidx + NrankPC*this_chan + NrankPC*Nchan * bid] +=  xsum;
+            }
+        }
+    }
+    ''',
+
+    'average_snips_v3': '''
+    __global__ void average_snips_v3(
+            const float *Params, const int *ioff, const int *id, const float *uproj,
+            const float *cmax, float *bigArray)
+    {
+
+        // jic, version to work with Nfeatures threads
+        // have made a big array of Nfeature*NfeatW*Nfilters so projections
+        // onto each Nfeature can be summed without collisions
+        // after running this, need to sum up each set of Nfeature subArrays
+        // to calculate the final NfeatW*Nfilters array
+
+        int tid, bid, ind, Nspikes, Nfeatures, NfeatW;
+        float xsum = 0.0f;
+
+        Nspikes               = (int) Params[0];
+        Nfeatures             = (int) Params[1];
+        NfeatW                = (int) Params[4];
+
+        tid       = threadIdx.x;      //feature index
+        bid 		= blockIdx.x;       //filter index
+
+        for(ind=0; ind<Nspikes;ind++) {
+            if (id[ind]==bid){
+                //uproj is Nfeatures x Nspikes
+                xsum = uproj[tid + Nfeatures * ind];
+                //add this to the Nfeature-th array of NfeatW at the offset for this spike
+                bigArray[ioff[ind] + tid + tid*NfeatW + Nfeatures*NfeatW * bid] +=  xsum;
+            }  //end of if block for  match
+        }     //end of loop over spikes
+
+    }
+    ''',
+
+    'sum_dWu': '''
+    __global__ void sum_dWU(const float *Params, const float *bigArray, float *WU)
+    {
+
+        int tid,bid, ind, Nfilters, Nthreads, Nfeatures, Nblocks, NfeatW, nWU, nElem;
+        float sum = 0.0f;
+
+        Nfeatures             = (int) Params[1];
+        NfeatW                = (int) Params[4];
+        Nfilters              = (int) Params[2];
+        Nthreads              = blockDim.x;
+        Nblocks               = gridDim.x;
+
+        tid 		= threadIdx.x;
+        bid 		= blockIdx.x;
+
+
+        //WU is NfeatW x Nfilters.
+
+        nWU = NfeatW * Nfilters;
+        nElem = Nfeatures*NfeatW; //number of elements in each subArray of bigArray
+
+        //Calculate which element we're addressing
+        int tind = tid + bid * Nthreads;
+
+        int currFilt, currFW, currIndex;
+        while (tind < nWU){
+
+
+            //which filter and element of WU?
+            currFilt = floor((double)(tind/NfeatW));
+            currFW = tind - currFilt*NfeatW;
+
+            //Sum up the Nfeature elements of bigArray that correspond to this
+            //filter and NfeatW
+
+            sum = 0.0f;
+
+            for(ind=0; ind<Nfeatures; ind++) {
+                //bigArray is Nfilter arrays of Nfeature x NfeatW;
+                currIndex = currFilt*nElem + ind*NfeatW + currFW;
+                sum += bigArray[ currIndex ];
+            }
+
+            WU[tind] += sum;
+            tind += Nblocks*Nthreads;
+
+        }
+    }
+    ''',
+
+    'count_spikes': '''
+    __global__ void count_spikes(
+            const float *Params, const int *id, int *nsp, const float *x, float *V)
+    {
+
+        int tid, tind, bid, ind, Nspikes, Nfilters, NthreadsMe, Nblocks;
+
+        Nspikes               = (int) Params[0];
+        Nfilters             = (int) Params[2];
+
+        tid 		= threadIdx.x;
+        bid 		= blockIdx.x;
+        NthreadsMe              = blockDim.x;
+        Nblocks               = gridDim.x;
+
+        tind = tid + NthreadsMe *bid;
+
+        while (tind<Nfilters){
+            for(ind=0; ind<Nspikes;ind++)
+                if (id[ind]==tind){
+                    nsp[tind] ++;
+                    V[tind] += x[tind];
+                }
+            V[tind] = V[tind] / (.001f + (float) nsp[tind]);
+
+            tind += NthreadsMe * Nblocks;
+        }
+    }
+    ''',
+
+    'computeCost2': '''
+
+    // WARNING: this computeCost2 function is for mexDistances2, the other one is for
+    // mexClustering2.
+
+    __global__ void computeCost2(
+            const float *Params, const float *Ws, const float *mus,
+            const float *W, const float *mu, const bool *iMatch,
+            const int *iC, const int *Wh, float *cmax)
+    {
+
+        int j, tid, bid, Nspikes, my_chan, this_chan, Nchan, NrankPC, NchanNear, Nthreads, k;
+        float xsum = 0.0f, Ci;
+
+        Nspikes               = (int) Params[0];
+        Nchan                 = (int) Params[7];
+        NrankPC                 = (int) Params[1];
+        NchanNear                 = (int) Params[6];
+        Nthreads              = blockDim.x;
+
+
+        tid 		= threadIdx.x;
+        bid 		= blockIdx.x;
+
+        while(tid<Nspikes){
+            my_chan = Wh[tid];
+            if (iMatch[my_chan + bid*Nchan]){
+                xsum = 0.0f;
+                for (k=0;k<NchanNear;k++){
+                    this_chan = iC[k + NchanNear * my_chan];
+                    for (j=0;j<NrankPC;j++)
+                        xsum += Ws[j + NrankPC*k + NrankPC*NchanNear * tid] *
+                                W[j + NrankPC*this_chan + NrankPC*Nchan * bid];
+
+                }
+
+                Ci = mu[bid]*mu[bid] + mus[tid]*mus[tid] -2*mus[tid]*mu[bid]*xsum;
+                cmax[tid + bid*Nspikes] = Ci;
+            }
+            tid+= Nthreads;
+        }
+    }
+    ''',
+
+    'bestFilter2': '''
+
+    // WARNING: this bestFilter2 function is for mexDistances2, the other one is for
+    // mexClustering 2.
+
+    __global__ void bestFilter2(
+            const float *Params, const bool *iMatch,
+            const int *Wh, const float *cmax, const float *mus, int *id, float *x)
+    {
+
+        int tid,tind,bid, my_chan, ind, Nspikes, Nfilters, Nthreads, Nchan, Nblocks;
+        float max_running = 0.0f;
+
+        Nspikes               = (int) Params[0];
+        Nfilters              = (int) Params[2];
+        Nchan                 = (int) Params[7];
+        Nthreads              = blockDim.x;
+        Nblocks               = gridDim.x;
+
+        tid 		= threadIdx.x;
+        bid 		= blockIdx.x;
+
+        tind = tid + bid * Nthreads;
+
+        while (tind<Nspikes){
+            max_running = mus[tind] * mus[tind];
+            id[tind] = 0;
+            my_chan = Wh[tind];
+            for(ind=0; ind<Nfilters; ind++)
+                if (iMatch[my_chan + ind * Nchan])
+                    if (cmax[tind + ind*Nspikes] < max_running){
+                        id[tind] = ind;
+                        max_running = cmax[tind + ind*Nspikes];
+                    }
+            x[tind] = max_running;
+            tind += Nblocks*Nthreads;
+        }
+
+    }
+    ''',
 }
 
 
@@ -479,7 +790,7 @@ def extractPCbatch2(proc, params, probe, wPCA, ibatch, iC, Nbatch):
     batchstart = np.arange(0, NT * Nbatch + 1, NT)  # batches start at these timepoints
 
     offset = Nchan * batchstart[ibatch]
-    dat = proc[offset:offset + NT * Nchan].reshape((-1, Nchan), order='F')
+    dat = proc.flat[offset:offset + NT * Nchan].reshape((-1, Nchan), order='F')
     dataRAW = cp.asarray(dat, dtype=np.float32) / params.scaleproc
 
     # another Params variable to take all our parameters into the C++ code
@@ -490,3 +801,79 @@ def extractPCbatch2(proc, params, probe, wPCA, ibatch, iC, Nbatch):
     uS, idchan = mexThSpkPC(Params, dataRAW, wPCA, iC)
 
     return uS, idchan
+
+
+def mexClustering2(Params, uproj, W, mu, call, iMatch, iC):
+    Nspikes = int(Params[0])
+    NrankPC = int(Params[1])
+    Nfilters = int(Params[2])
+    NchanNear = int(Params[6])
+    Nchan = int(Params[7])
+
+    d_Params = cp.asarray(Params, dtype=np.float32, order='F')
+    d_uproj = cp.asarray(uproj, dtype=np.float32, order='F')
+    d_W = cp.asarray(W, dtype=np.float32, order='F')
+    d_mu = cp.asarray(mu, dtype=np.float32, order='F')
+    d_call = cp.asarray(call, dtype=np.int32, order='F')
+    d_iC = cp.asarray(iC, dtype=np.int32, order='F')
+    d_iMatch = cp.asarray(iMatch, dtype=np.bool, order='F')
+
+    d_dWU = cp.zeros((NrankPC * Nchan, Nfilters), dtype=np.float32, order='F')
+    d_cmax = cp.zeros((Nspikes, Nfilters), dtype=np.float32, order='F')
+    d_id = cp.zeros(Nspikes, dtype=np.int32, order='F')
+    d_x = cp.zeros(Nspikes, dtype=np.float32, order='F')
+    d_nsp = cp.zeros(Nfilters, dtype=np.int32, order='F')
+    d_V = cp.zeros(Nfilters, dtype=np.float32, order='F')
+
+    # get list of cmaxes for each combination of neuron and filter
+    computeCost = _get_kernel('computeCost')
+    computeCost(
+        (Nfilters,), (1024,), (d_Params, d_uproj, d_mu, d_W, d_iMatch, d_iC, d_call, d_cmax))
+
+    # loop through cmax to find best template
+    bestFilter = _get_kernel('bestFilter')
+    bestFilter((40,), (256,), (d_Params, d_iMatch, d_iC, d_call, d_cmax, d_id, d_x))
+
+    # average all spikes for same template -- ORIGINAL
+    average_snips = _get_kernel('average_snips')
+    average_snips(
+        (Nfilters,), (NrankPC, NchanNear), (d_Params, d_iC, d_call, d_id, d_uproj, d_cmax, d_dWU))
+
+    count_spikes = _get_kernel('count_spikes')
+    count_spikes((7,), (256,), (d_Params, d_id, d_nsp, d_x, d_V))
+
+    del d_Params, d_V
+
+    return d_dWU, d_id, d_x, d_nsp, d_cmax
+
+
+def mexDistances2(Params, Ws, W, iMatch, iC, Wh, mus, mu):
+    Nspikes = int(Params[0])
+    Nfilters = int(Params[2])
+
+    d_Params = cp.asarray(Params, dtype=np.float32, order='F')
+
+    d_Ws = cp.asarray(Ws, dtype=np.float32, order='F')
+    d_W = cp.asarray(W, dtype=np.float32, order='F')
+    d_iMatch = cp.asarray(iMatch, dtype=np.bool, order='F')
+    d_iC = cp.asarray(iC, dtype=np.int32, order='F')
+    d_Wh = cp.asarray(Wh, dtype=np.int32, order='F')
+    d_mu = cp.asarray(mu, dtype=np.float32, order='F')
+    d_mus = cp.asarray(mus, dtype=np.float32, order='F')
+
+    d_cmax = cp.zeros(Nspikes * Nfilters, dtype=np.float32, order='F')
+    d_id = cp.zeros(Nspikes, dtype=np.int32, order='F')
+    d_x = cp.zeros(Nspikes, dtype=np.float32, order='F')
+
+    # get list of cmaxes for each combination of neuron and filter
+    computeCost2 = _get_kernel('computeCost2')
+    computeCost2(
+        (Nfilters,), (1024,), (d_Params, d_Ws, d_mus, d_W, d_mu, d_iMatch, d_iC, d_Wh, d_cmax))
+
+    # loop through cmax to find best template
+    bestFilter2 = _get_kernel('bestFilter2')
+    bestFilter2((40,), (256,), (d_Params, d_iMatch, d_Wh, d_cmax, d_mus, d_id, d_x))
+
+    del d_Params, d_cmax
+
+    return d_id, d_x
