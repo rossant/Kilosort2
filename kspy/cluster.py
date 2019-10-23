@@ -221,19 +221,20 @@ def mexThSpkPC(Params, dataRAW, wPCA, iC):
     code, constants = get_cuda('mexThSpkPC')
     Nthreads = constants.Nthreads
     maxFR = constants.maxFR
+
     NT, Nchan, NchanNear, nt0, nt0min, spkTh, NrankPC = Params
     NT = int(NT)
     Nchan = int(Nchan)
 
     # Input GPU arrays.
-    d_Params = cp.asarray(Params, dtype=np.float32, order='F')
+    d_Params = cp.asarray(Params, dtype=np.float64, order='F')
     d_data = cp.asarray(dataRAW, dtype=np.float32, order='F')
     d_W = cp.asarray(wPCA, dtype=np.float32, order='F')
     d_iC = cp.asarray(iC, dtype=np.int32, order='F')
 
     # New GPU arrays.
-    d_dout = cp.zeros(NT * Nchan, dtype=np.float32, order='F')
-    d_dmax = cp.zeros(NT * Nchan, dtype=np.float32, order='F')
+    d_dout = cp.zeros((Nchan, NT), dtype=np.float32, order='F')
+    d_dmax = cp.zeros((Nchan, NT), dtype=np.float32, order='F')
     d_st = cp.zeros(maxFR, dtype=np.int32, order='F')
     d_id = cp.zeros(maxFR, dtype=np.int32, order='F')
     d_counter = cp.zeros(1, dtype=np.int32, order='F')
@@ -261,7 +262,7 @@ def mexThSpkPC(Params, dataRAW, wPCA, iC):
     d_id2 = cp.zeros(minSize, dtype=np.int32, order='F')
 
     if (minSize > 0):
-        computeProjections = _get_kernel('computeProjections')
+        computeProjections = cp.RawKernel(code, 'computeProjections')
         computeProjections(
             (minSize,), (NchanNear, NrankPC), (d_Params, d_data, d_iC, d_st, d_id, d_W, d_featPC))
 
@@ -319,7 +320,7 @@ def mexClustering2(Params, uproj, W, mu, call, iMatch, iC):
     NchanNear = int(Params[6])
     Nchan = int(Params[7])
 
-    d_Params = cp.asarray(Params, dtype=np.float32, order='F')
+    d_Params = cp.asarray(Params, dtype=np.float64, order='F')
     d_uproj = cp.asarray(uproj, dtype=np.float32, order='F')
     d_W = cp.asarray(W, dtype=np.float32, order='F')
     d_mu = cp.asarray(mu, dtype=np.float32, order='F')
@@ -362,7 +363,7 @@ def mexDistances2(Params, Ws, W, iMatch, iC, Wh, mus, mu):
     Nspikes = int(Params[0])
     Nfilters = int(Params[2])
 
-    d_Params = cp.asarray(Params, dtype=np.float32, order='F')
+    d_Params = cp.asarray(Params, dtype=np.float64, order='F')
 
     d_Ws = cp.asarray(Ws, dtype=np.float32, order='F')
     d_W = cp.asarray(W, dtype=np.float32, order='F')
@@ -377,13 +378,13 @@ def mexDistances2(Params, Ws, W, iMatch, iC, Wh, mus, mu):
     d_x = cp.zeros(Nspikes, dtype=np.float32, order='F')
 
     # get list of cmaxes for each combination of neuron and filter
-    computeCost2 = cp.RawKernel(code, 'computeCost2')
-    computeCost2(
+    computeCost = cp.RawKernel(code, 'computeCost')
+    computeCost(
         (Nfilters,), (1024,), (d_Params, d_Ws, d_mus, d_W, d_mu, d_iMatch, d_iC, d_Wh, d_cmax))
 
     # loop through cmax to find best template
-    bestFilter2 = cp.RawKernel(code, 'bestFilter2')
-    bestFilter2((40,), (256,), (d_Params, d_iMatch, d_Wh, d_cmax, d_mus, d_id, d_x))
+    bestFilter = cp.RawKernel(code, 'bestFilter')
+    bestFilter((40,), (256,), (d_Params, d_iMatch, d_Wh, d_cmax, d_mus, d_id, d_x))
 
     del d_Params, d_cmax
 

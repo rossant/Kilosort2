@@ -86,7 +86,7 @@ __global__ void  computeProjections(const double *Params, const float *dataraw,
     }
 
 //////////////////////////////////////////////////////////////////////////////////////////
-__global__ void  maxChannels(const double *Params, const float *dataraw, const float *data,
+__global__ void maxChannels(const double *Params, const float *dataraw, const float *data,
 	const int *iC, int *st, int *id, int *counter){
 
   int nt0, indx, tid, tid0, i, bid, NT, Nchan, NchanNear,j,iChan, nt0min;

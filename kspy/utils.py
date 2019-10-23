@@ -47,5 +47,5 @@ def get_cuda(fn):
     path = Path(__file__).parent / 'cuda' / (fn + '.cu')
     assert path.exists
     code = path.read_text()
-    code = code.replace('__global__ void	', 'extern "C" __global__ void	')
+    code = code.replace('__global__ void', 'extern "C" __global__ void')
     return code, Bunch(extract_constants_from_cuda(code))

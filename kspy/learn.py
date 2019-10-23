@@ -214,7 +214,7 @@ def mexGetSpikes2(Params, drez, wTEMP, iC):
     # tpF = (16, Nnearest)
     tpS = (nt0, 16)
 
-    d_Params = cp.asarray(Params, dtype=np.float32, order='F')
+    d_Params = cp.asarray(Params, dtype=np.float64, order='F')
     d_data = cp.asarray(drez, dtype=np.float32, order='F')
     d_W = cp.asarray(wTEMP, dtype=np.float32, order='F')
     d_iC = cp.asarray(iC, dtype=np.int32, order='F')
@@ -284,7 +284,7 @@ def mexSVDsmall2(Params, dWU, W, iC, iW, Ka, Kb):
     Nrank = Params[6]
     Nchan = Params[9]
 
-    d_Params = cp.asarray(Params, dtype=np.float32, order='F')
+    d_Params = cp.asarray(Params, dtype=np.float64, order='F')
 
     d_dWU = cp.asarray(dWU, dtype=np.float64, order='F')
     d_iC = cp.asarray(iC, dtype=np.int32, order='F')
@@ -342,7 +342,7 @@ def mexMPnu8(Params, dataRAW, U, W, mu, iC, iW, UtU, iList, wPCA):
     NchanU = int(Params[10])
     Nchan = int(Params[9])
 
-    d_Params = cp.asarray(Params, dtype=np.float32, order='F')
+    d_Params = cp.asarray(Params, dtype=np.float64, order='F')
 
     d_draw = cp.asarray(dataRAW, dtype=np.float32, order='F')
     d_U = cp.asarray(U, dtype=np.float32, order='F')
@@ -477,7 +477,7 @@ def mexWtW2(Params, W1, W2, UtU):
     Nfilt = int(Params[1])
     nt0 = int(Params[9])
 
-    d_Params = cp.asarray(Params, dtype=np.float32, order='F')
+    d_Params = cp.asarray(Params, dtype=np.float64, order='F')
 
     d_W1 = cp.asarray(W1, dtype=np.float32, order='F')
     d_W2 = cp.asarray(W2, dtype=np.float32, order='F')
