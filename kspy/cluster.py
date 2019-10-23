@@ -1,9 +1,15 @@
+import logging
+from math import ceil
+
 import numpy as np
 import cupy as cp
+from tqdm import tqdm
 
-from preprocess import my_min, my_sum
-from cptools import svdecon, free_gpu_memory
-from utils import Bunch, p
+from preprocess import my_min, my_sum, get_Nbatch
+from cptools import svdecon, zscore
+from utils import Bunch
+
+logger = logging.getLogger(__name__)
 
 
 def getClosestChannels(probe, sigma, NchanClosest):
@@ -77,7 +83,7 @@ def get_SpikeSample(dataRAW, row, col, params):
     ix = indsT + indsC * nT
 
     # grab the data and reshape it appropriately (time samples  by channels by num spikes)
-    clips = dataRAW.T.ravel()[ix[:, 0, :]].reshape((dt.size, row.size))
+    clips = dataRAW.T.ravel()[ix[:, 0, :]].reshape((dt.size, row.size), order='F')  # HERE
     return clips
 
 
@@ -145,7 +151,7 @@ def sortBatches2(ccb0):
     # this learning rate should usually work fine, since it scales with the average gradient
     # and ccb0 is z-scored
     eta = 1
-    for k in range(niB):
+    for k in tqdm(range(niB), desc="Sorting %d batches" % ccb0.shape[0]):
         # euclidian distances between 1D embedding positions
         ds = (xs - xs[:, np.newaxis]) ** 2
         # the transformed distances go through this function
@@ -186,23 +192,25 @@ def initializeWdata2(call, uprojDAT, Nchan, nPCs, Nfilt, iC):
     # some more parameters need to be passed in from the main workspace
 
     # pick random spikes from the sample
-    irand = np.ceil(np.random.rand(Nfilt, 1) * uprojDAT.shape[1]).astype(np.int32)
+    # WARNING: replace ceil by warning because this is a random index, and 0/1 indexing
+    # discrepancy between Python and MATLAB.
+    irand = np.floor(np.random.rand(Nfilt) * uprojDAT.shape[1]).astype(np.int32)
 
     W = cp.zeros((nPCs, Nchan, Nfilt), dtype=np.float32)
 
     for t in range(Nfilt):
         ich = iC[:, call[irand[t]]]  # the channels on which this spike lives
         # for each selected spike, get its features
-        W[:, ich, t] = cp.atleast_3d(uprojDAT[:, irand[t]].reshape((nPCs, -1)))
+        W[:, ich, t] = uprojDAT[:, irand[t]].reshape(W[:, ich, t].shape, order='F')
 
-    W = W.reshape((-1, Nfilt))
+    W = W.reshape((-1, Nfilt), order='F')  # HERE
     # add small amount of noise in case we accidentally picked the same spike twice
     W = W + .001 * cp.random.normal(size=W.shape).astype(np.float32)
     mu = cp.sqrt(cp.sum(W ** 2, axis=0))  # get the mean of the template
     W = W / (1e-5 + mu)  # and normalize the template
-    W = W.reshape((nPCs, Nchan, Nfilt))
+    W = W.reshape((nPCs, Nchan, Nfilt), order='F')  # HERE
     nW = (W[0, ...] ** 2)  # squared amplitude of the first PC feture
-    W = W.reshape((nPCs * Nchan, Nfilt))
+    W = W.reshape((nPCs * Nchan, Nfilt), order='F')  # HERE
     # determine biggest channel according to the amplitude of the first PC
     Wheights = cp.argmax(nW, axis=0)
 
@@ -877,3 +885,146 @@ def mexDistances2(Params, Ws, W, iMatch, iC, Wh, mus, mu):
     del d_Params, d_cmax
 
     return d_id, d_x
+
+
+def clusterSingleBatches(raw_data=None, proc=None, probe=None, params=None):
+    Nbatch = get_Nbatch(raw_data, params)
+
+    if not params.reorder:
+        # if reordering is turned off, return consecutive order
+        iorig = np.arange(Nbatch)
+        return iorig, None, None
+
+    nPCs = params.nPCs
+    Nfilt = ceil(probe.Nchan / 2)
+
+    # extract PCA waveforms pooled over channels
+    wPCA = extractPCfromSnippets(proc, probe=probe, params=params, Nbatch=Nbatch)
+
+    Nchan = probe.Nchan
+    niter = 10  # iterations for k-means. we won't run it to convergence to save time
+
+    nBatches = Nbatch
+    NchanNear = min(Nchan, 2*8+1)
+
+    # initialize big arrays on the GPU to hold the results from each batch
+    # this holds the unit norm templates
+    Ws = cp.zeros((nPCs, NchanNear, Nfilt, nBatches), dtype=np.float32, order='F')
+    # this holds the scalings
+    mus = cp.zeros((Nfilt, nBatches), dtype=np.float32, order='F')
+    # this holds the number of spikes for that cluster
+    ns = cp.zeros((Nfilt, nBatches), dtype=np.float32, order='F')
+    # this holds the center channel for each template
+    Whs = 1 + cp.zeros((Nfilt, nBatches), dtype=np.int32, order='F')
+
+    i0 = 0
+    NrankPC = 3  # I am not sure if this gets used, but it goes into the function
+
+    # return an array of closest channels for each channel
+    iC = getClosestChannels(probe, params.sigmaMask, probe.NchanNear)[0]
+
+    for ibatch in tqdm(range(nBatches), desc="Clustering spikes"):
+
+        # extract spikes using PCA waveforms
+        uproj, call = extractPCbatch2(
+            proc, params, probe, wPCA, min(nBatches-2, ibatch), iC, Nbatch)
+
+        if cp.sum(cp.isnan(uproj)) > 0:
+            break  # I am not sure what case this safeguards against....
+
+        if uproj.shape[1] > Nfilt:
+
+            # this initialize the k-means
+            W, mu, Wheights, irand = initializeWdata2(call, uproj, Nchan, nPCs, Nfilt, iC)
+
+            # Params is a whole bunch of parameters sent to the C++ scripts inside a float64 vector
+            Params = [uproj.shape[1], NrankPC, Nfilt, 0, W.shape[0], 0, NchanNear, Nchan]
+
+            for i in range(niter):
+
+                Wheights = Wheights.reshape((1, 1, -1), order='F')
+                iC = cp.atleast_3d(iC)
+
+                # we only compute distances to clusters on the same channels
+                # this tells us which spikes and which clusters might match
+                iMatch = cp.min(cp.abs(iC - Wheights), axis=0) < .1
+
+                # get iclust and update W
+                # CUDA script to efficiently compute distances for pairs in which iMatch is 1
+                dWU, iclust, dx, nsp, dV = mexClustering2(Params, uproj, W, mu, call, iMatch, iC)
+
+                dWU = dWU / (1e-5 + nsp.T)  # divide the cumulative waveform by the number of spike
+
+                mu = cp.sqrt(cp.sum(dWU ** 2, axis=0))  # norm of cluster template
+                W = dWU / (1e-5 + mu)  # unit normalize templates
+
+                W = W.reshape((nPCs, Nchan, Nfilt), order='F')
+                nW = W[0, ...] ** 2  # compute best channel from the square of the first PC feature
+                W = W.reshape((Nchan * nPCs, Nfilt), order='F')
+
+                Wheights = cp.argmax(nW, axis=0)  # the new best channel of each cluster template
+
+            # carefully keep track of cluster templates in dense format
+            W = W.reshape((nPCs, Nchan, Nfilt), order='F')
+            W0 = cp.zeros((nPCs, NchanNear, Nfilt), dtype=np.float32, order='F')
+            for t in range(Nfilt):
+                W0[..., t] = W[:, iC[:, Wheights[t]], t].squeeze()
+            # I don't really know why this needs another normalization
+            W0 = W0 / (1e-5 + cp.sum(cp.sum(W0 ** 2, axis=0)[np.newaxis, ...], axis=1) ** .5)
+
+        # if a batch doesn't have enough spikes, it gets the cluster templates of the previous batc
+        if 'W0' in locals():
+            Ws[..., ibatch] = W0
+            mus[:, ibatch] = mu
+            ns[:, ibatch] = nsp
+            Whs[:, ibatch] = Wheights.astype(np.int32)
+        else:
+            logger.warning('Data batch #%d only had %d spikes.', ibatch, uproj.shape[1])
+
+        i0 = i0 + Nfilt
+
+    # anothr one of these Params variables transporting parameters to the C++ code
+    Params = [1, NrankPC, Nfilt, 0, W.shape[0], 0, NchanNear, Nchan]
+    # the total number of templates is the number of templates per batch times the number of batch
+    Params[0] = Ws.shape[2] * Ws.shape[3]
+
+    # initialize dissimilarity matrix
+    ccb = cp.zeros((nBatches, nBatches), dtype=np.float32, order='F')
+
+    for ibatch in tqdm(range(nBatches), desc="Computing distances"):
+        # for every batch, compute in parallel its dissimilarity to ALL other batches
+        Wh0 = Whs[:, ibatch]  # this one is the primary batch
+        W0 = Ws[..., ibatch]
+        mu = mus[..., ibatch]
+
+        # embed the templates from the primary batch back into a full, sparse representation
+        W = cp.zeros((nPCs, Nchan, Nfilt), dtype=np.float32, order='F')
+        for t in range(Nfilt):
+            W[:, iC[:, Wh0[t]], t] = cp.atleast_3d(Ws[:, :, t, ibatch])
+
+        # pairs of templates that live on the same channels are potential "matches"
+        iMatch = cp.min(cp.abs(iC - Wh0.reshape((1, 1, -1), order='F')), axis=0) < .1
+
+        # compute dissimilarities for iMatch = 1
+        iclust, ds = mexDistances2(Params, Ws, W, iMatch, iC, Whs, mus, mu)
+
+        # ds are squared Euclidian distances
+        ds = ds.reshape((Nfilt, -1), order='F')  # this should just be an Nfilt-long vector
+        ds = cp.maximum(0, ds)
+
+        # weigh the distances according to number of spikes in cluster
+        ccb[ibatch, :] = cp.mean(cp.sqrt(ds) * ns, axis=0) / cp.mean(ns, axis=0)
+
+    # ccb = cp.asnumpy(ccb)
+    # some normalization steps are needed: zscoring, and symmetrizing ccb
+    ccb0 = zscore(ccb, axis=0)
+    ccb0 = ccb0 + ccb0.T
+
+    # sort by manifold embedding algorithm
+    # iorig is the sorting of the batches
+    # ccbsort is the resorted matrix (useful for diagnosing drift)
+    ccbsort, iorig = sortBatches2(ccb0)
+
+    logger.info("Finished clustering.")
+
+    return iorig, ccb0, ccbsort

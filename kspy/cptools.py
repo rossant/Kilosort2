@@ -174,6 +174,12 @@ def svdecon(X, nPC0=None):
     return U, S, V
 
 
+def zscore(a, axis=0):
+    mns = a.mean(axis=axis)
+    sstd = a.std(axis=axis, ddof=0)
+    return (a - mns) / sstd
+
+
 def free_gpu_memory():
     mempool = cp.get_default_memory_pool()
     pinned_mempool = cp.get_default_pinned_memory_pool()
