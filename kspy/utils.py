@@ -1,4 +1,7 @@
+from pathlib import Path
+import re
 import numpy as np
+# import cupy as cp
 
 
 class Bunch(dict):
@@ -28,3 +31,21 @@ def read_data(dat_path, offset=0, shape=None, dtype=None, axis=0):
     if shape:
         buff = buff.reshape(shape, order='F')
     return buff
+
+
+def extract_constants_from_cuda(code):
+    r = re.compile(r'const int\s+\S+\s+=\s+\S+.+')
+    m = r.search(code)
+    if m:
+        constants = m.group(0).replace('const int', '').replace(';', '').split(',')
+        for const in constants:
+            a, b = const.strip().split('=')
+            yield a.strip(), int(b.strip())
+
+
+def get_cuda(fn):
+    path = Path(__file__).parent / 'cuda' / (fn + '.cu')
+    assert path.exists
+    code = path.read_text()
+    code = code.replace('__global__ void	', 'extern "C" __global__ void	')
+    return code, Bunch(extract_constants_from_cuda(code))
