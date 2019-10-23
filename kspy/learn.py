@@ -78,3 +78,48 @@ def extractTemplatesfromSnippets(proc=None, probe=None, params=None, Nbatch=None
     wPCA[:, 0] = -wPCA[:, 0] * cp.sign(wPCA[nt0min, 0])
 
     return wTEMP, wPCA
+
+
+def getKernels(params):
+    # this function makes upsampling kernels for the temporal components.
+    # those are used for interpolating the biggest negative peak,
+    # and aligning the template to that peak with sub-sample resolution
+    # needs nup, the interpolation factor (default = 10)
+    # also needs sig, the interpolation smoothness (default = 1)
+
+    nup = params.nup
+    sig = params.sig
+
+    nt0min = params.nt0min
+    nt0 = params.nt0
+
+    xs = cp.arange(1, nt0 + 1)
+    ys = cp.linspace(.5, nt0 + .5, nt0 * nup + 1)[:-1]
+
+    # these kernels are just standard kriging interpolators
+
+    # first compute distances between the sample coordinates
+    # for some reason, this seems to be circular, although the waveforms are not circular
+    # I think the reason had to do with some constant offsets in some channels?
+    d = cp.mod(xs[:, np.newaxis] - xs[np.newaxis, :] + nt0, nt0)
+    d = cp.minimum(d, nt0 - d)
+    # the kernel covariance uses a squared exponential of spatial scale sig
+    Kxx = cp.exp(-d ** 2 / sig ** 2)
+
+    # do the same for the kernel similarities between upsampled "test" timepoints and
+    # the original coordinates
+    d = cp.mod(ys[:, np.newaxis] - xs[np.newaxis, :] + nt0, nt0)
+    d = cp.minimum(d, nt0 - d)
+    Kyx = cp.exp(-d ** 2 / sig ** 2)
+
+    # the upsampling matrix is given by the following formula,
+    # with some light diagonal regularization of the matrix inversion
+    B = cp.dot(Kyx, cp.linalg.inv(Kxx + .01 * cp.eye(nt0)))
+    B = B.reshape((nup, nt0, nt0), order='F')
+
+    # A is just a slice through this upsampling matrix corresponding to the most negative point
+    # this is used to compute the biggest negative deflection (after upsampling)
+    A = cp.squeeze(B[:, nt0min - 1, :])
+    B = cp.transpose(B, [1, 2, 0])
+
+    return A.astype(np.float64), B.astype(np.float64)
