@@ -5,9 +5,9 @@ import numpy as np
 import cupy as cp
 from tqdm import tqdm
 
-from preprocess import my_min, my_sum, get_Nbatch
-from cptools import svdecon, zscore
-from utils import get_cuda
+from .preprocess import my_min, my_sum, get_Nbatch
+from .cptools import svdecon, zscore
+from .utils import get_cuda
 
 logger = logging.getLogger(__name__)
 

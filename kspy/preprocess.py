@@ -6,8 +6,8 @@ from scipy.signal import butter
 import cupy as cp
 from tqdm import tqdm
 
-from kspy.cptools import lfilter, median
-from kspy.utils import is_fortran, p
+from .cptools import lfilter, median
+from .utils import is_fortran, p
 
 logger = logging.getLogger(__name__)
 

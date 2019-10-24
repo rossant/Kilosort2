@@ -72,6 +72,7 @@ __global__ void	Conv1D(const double *Params, const float *data, const float *W, 
         __syncthreads();
     }
 }
+
 //////////////////////////////////////////////////////////////////////////////////////////
 __global__ void  bestFilter(const double *Params, const float *data,
 	float *err, int *ftype, int *kkmax, int *kall){
@@ -119,7 +120,6 @@ __global__ void	cleanup_spikes(const double *Params, const float *err,
   NT      	=   (int) Params[0];
   tid0 		= bid * blockDim.x ;
   Th 		= (float) Params[2];
-  //Th = 14.0f;
 
   while(tid0<NT-Nthreads-lockout+1){
       if (tid<2*lockout)
@@ -129,7 +129,7 @@ __global__ void	cleanup_spikes(const double *Params, const float *err,
       else
           sdata[tid+2*lockout] = 0.0f;
 
-      __syncthreads();
+          __syncthreads();
 
       err0 = sdata[tid+lockout];
       t0 = tid+lockout         + tid0;
@@ -150,7 +150,7 @@ __global__ void	cleanup_spikes(const double *Params, const float *err,
           }
       }
 
-      tid0 += blockDim.x * gridDim.x;
+      tid0 = tid0 + blockDim.x * gridDim.x;
   }
 }
 
@@ -198,6 +198,7 @@ __global__ void	cleanup_heights(const double *Params, const float *x,
   }
 
 }
+
 //////////////////////////////////////////////////////////////////////////////////////////
 __global__ void extract_snips(const double *Params, const int *st, const int *id,
         const int *counter, const float *dataraw,  float *WU){

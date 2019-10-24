@@ -76,7 +76,7 @@ __global__ void getW(const double *Params, double *wtw, double *W){
 
   int Nfilt, nt0, tid, bid, i, t, Nrank,k, tmax;
   double x, x0, xmax;
-  volatile __shared__ double sW[nt0max*NrankMax2], swtw[nt0max*nt0max], xN[1];
+  volatile __shared__ double sW[nt0max*NrankMax], swtw[nt0max*nt0max], xN[1];
 
   nt0       = (int) Params[4];
    Nrank       = (int) Params[6];
@@ -144,7 +144,7 @@ __global__ void reNormalize(const double *Params, const double *A, const double 
     int Nfilt, nt0, tid, bid, Nchan,k, Nrank, imax, t, ishift, tmax;
     double x, xmax, xshift, sgnmax;
 
-    volatile __shared__ double sW[NrankMax2*nt0max], sU[NchanMax*NrankMax2], sS[NrankMax2+1],
+    volatile __shared__ double sW[NrankMax*nt0max], sU[NchanMax*NrankMax], sS[NrankMax+1],
             sWup[nt0max*10];
 
     nt0       = (int) Params[4];
