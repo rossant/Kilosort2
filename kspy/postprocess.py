@@ -4,6 +4,7 @@ from math import erf, log, sqrt
 from .cptools import svdecon
 from .cluster import getClosestChannels
 from .learn import getKernels, getMeWtW, mexSVDsmall2
+from .utils import Bunch
 
 
 def ccg(st1, st2, nbins, tbin):
@@ -485,7 +486,7 @@ def splitAllClusters(rez, flag):
 
     # (DEV_NOTES) line below is incompatible with new implementation of getKernels
 
-    Ka, Kb = getKernels(ops, 10, 1)  # we get the time upsampling kernels again
+    Ka, Kb = getKernels(Bunch({'nt0min':ops.nt0min, 'nt0':ops.nt0, 'nup':10, 'sig':1}))  # we get the time upsampling kernels again
     rez.W, rez.U, rez.mu = mexSVDsmall2(Params, rez.dWU, rez.W, iC - 1, iW - 1, Ka, Kb)  # we run SVD
 
     WtW, iList = getMeWtW(rez.W.astype(cp.float32), rez.U.astype(cp.float32), Nnearest)  # we re-compute similarity scores between templates
