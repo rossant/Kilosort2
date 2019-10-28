@@ -211,6 +211,8 @@ def my_conv2(S1, sig, axis):
     S1 = S1[tmax:, :]
     S1 /= cNorm
 
+    return S1
+
 
 def set_cutoff(rez):
     # after everything else is done, this function takes spike trains and cuts off
