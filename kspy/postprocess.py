@@ -443,8 +443,8 @@ def splitAllClusters(rez, flag):
             continue
 
         # now decide if the split would result in waveforms that are too similar
-        c1 = cp.matmul(wPCA, cp.reshape(cp.mean(clp0[ilow, :], 0), 3, -1))  # the reconstructed mean waveforms for putative cluster 1
-        c2 = cp.matmul(wPCA, cp.reshape(cp.mean(clp0[~ilow, :], 0), 3, -1))  # the reconstructed mean waveforms for putative cluster 2
+        c1 = cp.matmul(wPCA, cp.mean(clp0[ilow, :], 0).reshape(3, -1))  # the reconstructed mean waveforms for putative cluster 1
+        c2 = cp.matmul(wPCA, cp.mean(clp0[~ilow, :], 0).reshape(3, -1))  # the reconstructed mean waveforms for putative cluster 2
         cc = cp.corrcoef(c1, c2)  # correlation of mean waveforms
         n1 = sqrt(cp.sum(c1 ** 2))  # the amplitude estimate 1
         n2 = sqrt(cp.sum(c2 ** 2))  # the amplitude estimate 2
@@ -520,3 +520,5 @@ def splitAllClusters(rez, flag):
     rez.Wphy = cp.concatenate((cp.zeros((1 + ops.ntomin, Nfilt + 1, Nrank)), rez.W), axis=0)
 
     rez.isplit = isplit  # keep track of origins for each cluster
+
+    return rez
