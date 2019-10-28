@@ -1,7 +1,8 @@
 import cupy as cp
-from math import erf, log, sqrt
+import numpy as np
+from math import erf, log, sqrt, ceil
 
-from .cptools import svdecon
+from .cptools import svdecon, lfilter
 from .cluster import getClosestChannels
 from .learn import getKernels, getMeWtW, mexSVDsmall2
 from .utils import Bunch
@@ -98,10 +99,6 @@ def ccg(st1, st2, nbins, tbin):
         Ri[i - 1] = p  # keep track of p for each bin size i
 
     K[nbins] = a  # restore the center value of the cross-correlogram
-    Qin = Qi / Q00  # normalize the normalized refractory index in two different ways
-    Qin1 = Qi / Q01
-
-    # (DEV_NOTES) Variables Qin and Qin1 seem redundant?
 
     return K, Qi, Q00, Q01, Ri
 
@@ -194,6 +191,25 @@ def find_merges(rez, flag):
         rez.Q_CCG = cp.minimum(rez.Q_CCG, rez.Q_CCG.T)
 
     return rez
+
+
+def my_conv2(S1, sig, axis):
+    # S1 is matrix to be filtered
+    # sig is a scalar for standard deviation of gaussian filter
+    # axis to filter on
+    # currently only filtering on axis 0 is supported
+    # (DEV_NOTES) uses numpy arrays for compatibility with lfilter
+
+    tmax = ceil(4 * sig)
+    dt = np.arange(-tmax, tmax + 1)
+    gaus = np.exp(-dt ** 2 / (2 * sig ** 2))
+    gaus /= cp.sum(gaus)
+
+    cNorm = lfilter(gaus, 1, cp.concatenate((cp.ones((S1.shape[0], 1)), cp.zeros((tmax, 1))), axis=0), axis=axis)
+    cNorm = cNorm[tmax:, :]
+    S1 = lfilter(gaus, 1, cp.concatenate((S1, cp.zeros((tmax, S1.shape[1]))), axis=0), axis=axis)
+    S1 = S1[tmax:, :]
+    S1 /= cNorm
 
 
 def set_cutoff(rez):
@@ -316,8 +332,7 @@ def splitAllClusters(rez, flag):
     if 'nt0min' not in ops:
         ops.nt0min = 20         # the waveforms must be aligned to this sample
 
-    iW = cp.argmax(cp.abs(rez.dWU[ops.nt0min, :, :]),
-                   axis=1)  # find the peak abs channel for each template
+    iW = cp.argmax(cp.abs(rez.dWU[ops.nt0min, :, :]), axis=1)  # find the peak abs channel for each template
     iW = iW.astype(cp.int32)
 
     isplit = cp.arange(1, Nfilt + 1)  # keep track of original cluster for each cluster. starts with all clusters being their own origin.
@@ -348,7 +363,7 @@ def splitAllClusters(rez, flag):
         # (DEV_NOTES) Python flattens clp0 in C order rather than Fortran order so the flattened PC projections will be slightly different,
         #             however this is fixed when the projections are reformed later
 
-        clp -= my_conv2(clp, 250, 1)  # subtract a running average, because the projections are NOT drift corrected
+        clp -= my_conv2(clp, 250, axis=0)  # subtract a running average, because the projections are NOT drift corrected
 
         # now use two different ways to initialize the bimodal direction
         # the main script calls this function twice, and does both initializations
