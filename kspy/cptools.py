@@ -116,9 +116,9 @@ def median(a, axis=0):
     index = part.shape[axis] // 2
     if part.shape[axis] % 2 == 1:
         # index with slice to allow mean (below) to work
-        indexer[axis] = slice(index, index+1)
+        indexer[axis] = slice(index, index + 1)
     else:
-        indexer[axis] = slice(index-1, index+1)
+        indexer[axis] = slice(index - 1, index + 1)
 
     return cp.mean(part[indexer], axis=axis)
 

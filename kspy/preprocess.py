@@ -84,9 +84,9 @@ def my_min(S1, sig, varargin=None):
         S1 = cp.reshape(S1, (S1.shape[0], -1))
         dsnew2 = S1.shape
         S1 = cp.concatenate(
-                (cp.full((sig, dsnew2[1]), np.inf), S1, cp.full((sig, dsnew2[1]), np.inf)), axis=0)
+            (cp.full((sig, dsnew2[1]), np.inf), S1, cp.full((sig, dsnew2[1]), np.inf)), axis=0)
         Smax = S1[:dsnew2[0], :]
-        for j in range(1, 2*sig + 1):
+        for j in range(1, 2 * sig + 1):
             Smax = cp.minimum(Smax, S1[j:j + dsnew2[0], :])
         S1 = cp.reshape(Smax, dsnew)
         S1 = cp.transpose(S1, list(range(1, idim + 1)) + [0] + list(range(idim + 1, Nd)))
@@ -116,9 +116,9 @@ def my_sum(S1, sig, varargin=None):
         S1 = cp.reshape(S1, (S1.shape[0], -1))
         dsnew2 = S1.shape
         S1 = cp.concatenate(
-                (cp.full((sig, dsnew2[1]), 0), S1, cp.full((sig, dsnew2[1]), 0)), axis=0)
+            (cp.full((sig, dsnew2[1]), 0), S1, cp.full((sig, dsnew2[1]), 0)), axis=0)
         Smax = S1[:dsnew2[0], :]
-        for j in range(1, 2*sig + 1):
+        for j in range(1, 2 * sig + 1):
             Smax = Smax + S1[j:j + dsnew2[0], :]
         S1 = cp.reshape(Smax, dsnew)
         S1 = cp.transpose(S1, list(range(1, idim + 1)) + [0] + list(range(idim + 1, Nd)))

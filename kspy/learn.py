@@ -428,7 +428,7 @@ def mexMPnu8(Params, dataRAW, U, W, mu, iC, iW, UtU, iList, wPCA):
 
         # subtract spikes from raw data here
         subtract_spikes = cp.RawKernel(code, 'subtract_spikes')
-        subtract_spikes((Nfilt,), tpS, (d_Params,  d_st, d_id, d_y, d_counter, d_draw, d_W, d_U))
+        subtract_spikes((Nfilt,), tpS, (d_Params, d_st, d_id, d_y, d_counter, d_draw, d_W, d_U))
 
         # filter the data with the spatial templates
         spaceFilterUpdate = cp.RawKernel(code, 'spaceFilterUpdate')
@@ -609,15 +609,15 @@ def learnAndSolve8b(params=None, probe=None, raw_data=None, proc=None, iorig=Non
     wPCAd = cp.asarray(wPCA, dtype=np.float64, order='F')  # convert to double for extra precision
 
     nt0 = params.nt0
-    nt0min  = params.nt0min
-    nBatches  = Nbatch
-    NT  	= params.NT
-    Nfilt 	= params.Nfilt
-    Nchan 	= probe.Nchan
+    nt0min = params.nt0min
+    nBatches = Nbatch
+    NT = params.NT
+    Nfilt = params.Nfilt
+    Nchan = probe.Nchan
 
     # two variables for the same thing? number of nearest channels to each primary channel
-    NchanNear   = min(probe.Nchan, 32)
-    Nnearest    = min(probe.Nchan, 32)
+    NchanNear = min(probe.Nchan, 32)
+    Nnearest = min(probe.Nchan, 32)
 
     # decay of gaussian spatial mask centered on a channel
     sigmaMask = params.sigmaMask
@@ -632,7 +632,8 @@ def learnAndSolve8b(params=None, probe=None, raw_data=None, proc=None, iorig=Non
     nhalf = int(ceil(nBatches / 2)) - 1  # halfway point
 
     # this batch order schedule goes through half of the data forward and backward during the model
-    # fitting and then goes through the data symmetrically-out from the center during the final pass
+    # fitting and then goes through the data symmetrically-out from the center during the final
+    # pass
     ischedule = np.concatenate(
         (np.arange(nhalf, nBatches), np.arange(nBatches - 1, nhalf - 1, -1)))
     i1 = np.arange(nhalf - 1, -1, -1)
@@ -758,10 +759,12 @@ def learnAndSolve8b(params=None, probe=None, raw_data=None, proc=None, iorig=Non
         # UtU is the gram matrix of the spatial components of the low-rank SVDs
         # it tells us which pairs of templates are likely to "interfere" with each other
         # such as when we subtract off a template
-        UtU, maskU, _ = getMeUtU(iW, iC, mask, Nnearest, Nchan)  # this needs to change (but I don't know why!)
+        # this needs to change (but I don't know why!)
+        UtU, maskU, _ = getMeUtU(iW, iC, mask, Nnearest, Nchan)
 
         # main CUDA function in the whole codebase. does the iterative template matching
-        # based on the current templates, gets features for these templates if requested (featW, featPC),
+        # based on the current templates, gets features for these templates if requested
+        # (featW, featPC),
         # gets scores for the template fits to each spike (vexp), outputs the average of
         # waveforms assigned to each cluster (dWU0),
         # and probably a few more things I forget about
@@ -784,7 +787,8 @@ def learnAndSolve8b(params=None, probe=None, raw_data=None, proc=None, iorig=Non
         # for each template
         fexp = np.exp(nsp0 * cp.log(pm[:Nfilt]))
         fexp = cp.reshape(fexp, (1, 1, -1), order='F')
-        dWU = dWU * fexp + (1 - fexp) * (dWU0 / cp.reshape(cp.maximum(1, nsp0), (1, 1, -1), order='F'))
+        dWU = dWU * fexp + (1 - fexp) * (dWU0 / cp.reshape(
+            cp.maximum(1, nsp0), (1, 1, -1), order='F'))
 
         # nsp just gets updated according to the fixed factor p1
         nsp = nsp * p1 + (1 - p1) * nsp0
@@ -839,11 +843,11 @@ def learnAndSolve8b(params=None, probe=None, raw_data=None, proc=None, iorig=Non
 
             if dWU0.shape[2] > 0:
                 # new templates need to be integrated into the same format as all templates
-                    # apply PCA for smoothing purposes
+                # apply PCA for smoothing purposes
                 dWU0 = cp.reshape(cp.dot(wPCAd, cp.dot(
                     wPCAd.T, dWU0.reshape(
                         (dWU0.shape[0], dWU0.shape[1] * dWU0.shape[2]), order='F'))),
-                                dWU0.shape, order='F')
+                    dWU0.shape, order='F')
                 dWU = cp.concatenate((dWU, dWU0), axis=2)
 
                 m = dWU0.shape[2]
@@ -918,7 +922,8 @@ def learnAndSolve8b(params=None, probe=None, raw_data=None, proc=None, iorig=Non
 
         if ibatch == niter - nBatches - 1:
             # allocate variables when switching to extraction phase
-            st3 = []  # cp.zeros((int(1e7), 5), dtype=np.float32, order='F')  # this holds spike times, clusters and other info per spike
+            # this holds spike times, clusters and other info per spike
+            st3 = []  # cp.zeros((int(1e7), 5), dtype=np.float32, order='F')
 
             # these next three store the low-d template decompositions
             temp.WA = []  # zeros(nt0, Nfilt, Nrank,nBatches,  'single')
@@ -926,8 +931,10 @@ def learnAndSolve8b(params=None, probe=None, raw_data=None, proc=None, iorig=Non
             temp.muA = []  # zeros(Nfilt, nBatches,  'single')
 
             # these ones store features per spike
-            fW = []  # zeros(Nnearest, 1e7, 'single')  # Nnearest is the number of nearest templates to store features for
-            fWpc = []  # zeros(NchanNear, Nrank, 1e7, 'single')  # NchanNear is the number of nearest channels to take PC features from
+            # Nnearest is the number of nearest templates to store features for
+            fW = []  # zeros(Nnearest, 1e7, 'single')
+            # NchanNear is the number of nearest channels to take PC features from
+            fWpc = []  # zeros(NchanNear, Nrank, 1e7, 'single')
 
         # ibatch, niter, Nfilt, nsp.sum(), median(mu), st0.size, ndrop
 
