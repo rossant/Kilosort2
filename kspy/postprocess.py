@@ -1,4 +1,5 @@
 import cupy as cp
+from cupyx.scipy.sparse import coo_matrix
 import numpy as np
 from math import erf, log, sqrt, ceil
 import shutil
@@ -104,6 +105,30 @@ def ccg(st1, st2, nbins, tbin):
     K[nbins] = a  # restore the center value of the cross-correlogram
 
     return K, Qi, Q00, Q01, Ri
+
+
+def clusterAverage(clu, spikeQuantity):
+    # get the average of some quantity across spikes in each cluster, given the
+    # quantity for each spike
+    #
+    # e.g.
+    # > clusterDepths = clusterAverage(clu, spikeDepths)
+    #
+    # clu and spikeQuantity must be vector, same size
+    #
+    # using a super-tricky algorithm for this - when you make a sparse
+    # array, the values of any duplicate indices are added. So this is the
+    # fastest way I know to make the sum of the entries of spikeQuantity for each of
+    # the unique entries of clu
+    _, cluInds, spikeCounts = cp.unique(clu, return_inverse=True, return_counts=True)
+
+    # summation
+    q = coo_matrix((spikeQuantity, (cluInds, cp.zeros(len(clu))))).toarray().flatten()
+
+    # had sums so dividing by spike counts gives the mean depth of each cluster
+    clusterQuantity = q / spikeCounts
+
+    return clusterQuantity
 
 
 def find_merges(rez, flag):
