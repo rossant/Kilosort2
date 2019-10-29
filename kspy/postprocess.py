@@ -1,6 +1,9 @@
 import cupy as cp
 import numpy as np
 from math import erf, log, sqrt, ceil
+import shutil
+import os
+from os.path import join
 
 from .cptools import svdecon, lfilter
 from .cluster import getClosestChannels
@@ -212,6 +215,136 @@ def my_conv2(S1, sig, axis):
     S1 /= cNorm
 
     return S1
+
+def rezToPhy(rez, savePath=None):
+    # pull out results from kilosort's rez to either return to workspace or to
+    # save in the appropriate format for the phy GUI to run on. If you provide
+    # a savePath it should be a folder
+
+    # spikeTimes will be in samples, not seconds
+    rez.W = cp.asnumpy(rez.Wphy).astype(np.float32)
+    rez.U = cp.asnumpy(rez.U).astype(np.float32)
+    rez.mu = cp.asnumpy(rez.mu).astype(np.float32)
+
+    if rez.st3.shape[1] > 4:
+        rez.st3 = rez.st3[:, :4]
+
+    isort = cp.argsort(rez.st3[:, 1])
+    rez.st3 = rez.st3[isort, :]
+    rez.cProj = rez.cProj[isort, :]
+    rez.cProjPC = rez.cProjPC[isort, :, :]
+
+    fs = os.listdir(savePath)
+    for file in fs:
+        if file.endswith('.npy'):
+            os.remove(join(savePath, file))
+    if os.path.isdir(join(savePath, '.phy')):
+        shutil.rmtree(join(savePath, '.phy'))
+
+    spikeTimes = rez.st3[:, 0].astype(cp.uint64)
+    spikeTemplates = rez.st3[:, 1].astype(cp.uint32)
+
+    # (DEV_NOTES) if statement below seems useless due to above if statement
+    if rez.st3.shape[1] > 4:
+        spikeClusters = (1 + rez.st3[:, 4]).astype(cp.uint32)
+
+    amplitudes = rez.st3[:, 2]
+
+    Nchan = rez.ops.Nchan
+
+    # FIX THIS PART: are the flattens below needed?
+    xcords = rez.xcords.flatten()
+    ycords = rez.ycords.flatten()
+    chanMap = rez.ops.chanMap.flatten()
+    chanMap0ind = chanMap - 1
+
+    nt0 = rez.W.shape[0]
+    # (DEV_NOTES) do we need U and rez.U?
+    U = rez.U
+    W = rez.W
+
+    Nfilt = rez.W.shape[1]
+
+    # (DEV_NOTES) 2 lines below can be combined
+    templates = cp.einsum('ikl,jkl->ijk', U, W).astype(cp.float32)
+    templates = cp.transpose(templates, (2,1,0)) # now it's nTemplates x nSamples x nChannels
+    templatesInds = cp.tile(np.arange(templates.shape[2]), templates.shape[0]) # we include all channels so this is trivial
+
+    templateFeatures = rez.cProj
+    templateFeatureInds = rez.iNeigh.astype(cp.uint32)
+    pcFeatures = rez.cProjPC
+    pcFeatureInds = rez.iNeighPC.astype(cp.uint32)
+    whiteningMatrix = rez.Wrot/rez.ops.scaleproc
+    whiteningMatrixinv = cp.linalg.pinv(whiteningMatrix)
+
+    # here we compute the amplitude of every template...
+
+    # unwhiten all the templates
+    tempsUnW = cp.einsum('ijk,kl->ijl', templates, whiteningMatrixinv)
+
+    # The amplitude on each channel is the positive peak minus the negative
+    tempChanAmps = cp.max(tempsUnW, axis=1) - cp.min(tempsUnW, axis=1)
+
+    # The template amplitude is the amplitude of its largest channel
+    tempAmpsUnscaled = cp.max(tempChanAmps, axis=1)
+
+    # assign all spikes the amplitude of their template multiplied by their
+    # scaling amplitudes
+    spikeAmps = tempAmpsUnscaled[spikeTemplates] * amplitudes
+
+    # take the average of all spike amps to get actual template amps (since
+    # tempScalingAmps are equal mean for all templates)
+    ta = clusterAverage(spikeTemplates, spikeAmps)
+    tids = cp.unique(spikeTemplates)
+    # (DEV_NOTES) line below is a horrible workaround as cp.max(tids) can't be read as an int
+    tempAmps = cp.array(np.zeros(cp.asnumpy(cp.max(tids))))
+    tempAmps[(tids-1)] = ta # because ta only has entries for templates that had at least one spike
+    if 'gain' in rez.ops:
+        gain = rez.ops.gain
+    else:
+        gain = 1
+    tempAmps = gain * cp.transpose(tempAmps)
+
+    # (DEV_NOTES) currently setting allow_pickle = False for compatibility, possibly worth changing
+    if savePath is not None:
+        cp.save(join(savePath, 'spike_times.npy'), spikeTimes, allow_pickle=False)
+        cp.save(join(savePath, 'spike_templates.npy'), (spikeTemplates - 1).astype(cp.uint32), allow_pickle=False) # -1 for zero indexing
+        if rez.st3.shape[1] > 4:
+            cp.save(join(savePath, 'spike_clusters.npy'), (spikeClusters - 1).astype(cp.uint32), allow_pickle=False) # -1 for zero indexing
+        else:
+            cp.save(join(savePath, 'spike_clusters.npy'), (spikeTemplates - 1).astype(cp.uint32), allow_pickle=False) # -1 for zero indexing
+        cp.save(join(savePath, 'amplitudes.npy'), spikeTimes, allow_pickle=False)
+        cp.save(join(savePath, 'templates.npy'), templates, allow_pickle=False)
+        cp.save(join(savePath, 'templates_ind.npy'), templatesInds, allow_pickle=False)
+
+        chanMap0ind = chanMap0ind.astype(cp.int32)
+
+        cp.save(join(savePath, 'channel_map.npy'), chanMap0ind, allow_pickle=False)
+        cp.save(join(savePath, 'channel_positions.npy'), cp.concatenate((xcords, ycords), axis=1), allow_pickle=False)
+
+        cp.save(join(savePath, 'template_features.npy'), templateFeatures, allow_pickle=False)
+        cp.save(join(savePath, 'template_feature_ind.npy'), templateFeatureInds.T - 1, allow_pickle=False) # -1 for zero indexing
+        cp.save(join(savePath, 'pc_features.npy'), pcFeatures, allow_pickle=False)
+        cp.save(join(savePath, 'pc_feature_ind.npy'), pcFeatures.T - 1, allow_pickle=False) # -1 for zero indexing
+
+        cp.save(join(savePath, 'whitening_mat.npy'), whiteningMatrix, allow_pickle=False)
+        cp.save(join(savePath, 'whitening_mat_inv.npy'), whiteningMatrixinv, allow_pickle=False)
+
+        if 'SimScore' in rez:
+            similarTemplates = rez.SimScore
+            cp.save(join(savePath, 'similar_templates.npy'), similarTemplates, allow_pickle=False)
+
+        # (DEV_NOTES) unused raw Matlab code
+        # % save a list of "good" clusters for Phy
+        # %     fileID = fopen(fullfile(savePath, 'channel_names.tsv'), 'w');
+        # %     fprintf(fileID, 'cluster_id%sKSLabel', char(9));
+        # %     for j = 1:Nchan
+        # %         fprintf(fileID, '%d%s%d', j-1,char(9),chanMap0ind(j));
+        # %         fprintf(fileID, char([13 10]));
+        # %     end
+        # %     fclose(fileID);
+
+
 
 
 def set_cutoff(rez):
