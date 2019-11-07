@@ -1,0 +1,7 @@
+function p(x)
+    x(1:5,1:min(end, 5))
+    size(x)
+    mean(x, 'all')
+    median(x, 'all')
+    min(x, [], 'all')
+    max(x, [], 'all')
